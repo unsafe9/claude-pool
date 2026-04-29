@@ -1,13 +1,37 @@
 package proxy
 
 import (
+	"context"
 	"net/http"
 	"net/http/httputil"
 	"time"
 )
 
+// ctxKey namespaces context values stored by this package.
+type ctxKey int
+
+const modeCtxKey ctxKey = iota
+
+// captureMode stores ptr in ctx so the Director can record the Mode it observed
+// at request-decision time. The wrapping handler reads the same ptr after
+// ServeHTTP returns, so the log entry reflects the routing decision instead of
+// a separate (potentially racy) read of state.
+func captureMode(ctx context.Context, ptr *Mode) context.Context {
+	return context.WithValue(ctx, modeCtxKey, ptr)
+}
+
+// recordMode writes mode to the slot installed by captureMode. No-op if the
+// context has no slot (e.g. Director invoked directly in unit tests).
+func recordMode(ctx context.Context, mode Mode) {
+	if ptr, ok := ctx.Value(modeCtxKey).(*Mode); ok {
+		*ptr = mode
+	}
+}
+
 // statusRecorder wraps http.ResponseWriter to capture the written status code.
-// It defaults to 200 in case WriteHeader is never called explicitly.
+// status stays 0 until WriteHeader is called, so the log can distinguish
+// "request completed normally" from "writer was never touched" (e.g. ReverseProxy
+// failed before sending headers).
 // It also implements http.Flusher so SSE streaming passes through.
 type statusRecorder struct {
 	http.ResponseWriter
@@ -46,13 +70,15 @@ func NewHandler(upstreamURL, fallbackAPIKey string, state *State, logger *Logger
 	// Everything else goes through the reverse proxy, wrapped for timing and logging.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		var mode Mode
+		r = r.WithContext(captureMode(r.Context(), &mode))
+		rec := &statusRecorder{ResponseWriter: w}
 		rp.ServeHTTP(rec, r)
 		logger.LogRequest(LogEntry{
 			Method:    r.Method,
 			Path:      r.URL.Path,
 			Status:    rec.status,
-			Mode:      string(state.CurrentMode()),
+			Mode:      mode,
 			LatencyMS: time.Since(start).Milliseconds(),
 		})
 	})

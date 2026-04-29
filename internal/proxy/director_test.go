@@ -63,9 +63,9 @@ func TestShouldSwap_FalseForRoot(t *testing.T) {
 // ---- Director unit tests ----
 
 const (
-	testUpstream   = "https://api.anthropic.com"
+	testUpstream    = "https://api.anthropic.com"
 	testFallbackKey = "sk-fallback-key"
-	testAuthToken  = "Bearer oauth-token"
+	testAuthToken   = "Bearer oauth-token"
 )
 
 func TestDirector_PassthroughInActive(t *testing.T) {

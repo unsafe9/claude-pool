@@ -97,7 +97,9 @@ func Classify(resp *http.Response) Decision {
 	if resp.Body == nil {
 		return Decision{}
 	}
-	buf, err := io.ReadAll(resp.Body)
+	// Cap the read so a hostile/buggy upstream can't OOM the proxy via a giant 429 body.
+	// 64 KiB is plenty for any plausible Anthropic error envelope.
+	buf, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	// Always restore body regardless of read outcome.
 	resp.Body = io.NopCloser(bytes.NewReader(buf))
 	if err != nil {

@@ -34,8 +34,13 @@ func NewDirector(upstreamURL, fallbackAPIKey string, state *State) func(*http.Re
 		// 2. Always count the request.
 		state.IncRequest()
 
-		// 3. Conditionally swap headers.
-		if state.CurrentMode() == ModeThrottled && fallbackAPIKey != "" && ShouldSwap(req.URL.Path) {
+		// 3. Read mode once and publish it for the request log so the routing
+		//    decision and the log line agree, even if state flips mid-flight.
+		mode := state.CurrentMode()
+		recordMode(req.Context(), mode)
+
+		// 4. Conditionally swap headers.
+		if mode == ModeThrottled && fallbackAPIKey != "" && ShouldSwap(req.URL.Path) {
 			req.Header.Del("Authorization")
 			req.Header.Set("X-Api-Key", fallbackAPIKey)
 			state.IncFallback()

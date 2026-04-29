@@ -18,7 +18,7 @@ func TestLogger_WritesValidJSONLine(t *testing.T) {
 		Method:    "POST",
 		Path:      "/v1/messages",
 		Status:    200,
-		Mode:      "oauth",
+		Mode:      ModeActive,
 		LatencyMS: 123,
 	}
 	l.LogRequest(entry)
@@ -54,7 +54,7 @@ func TestLogger_AutoTimestamp(t *testing.T) {
 		Method: "GET",
 		Path:   "/health",
 		Status: 200,
-		Mode:   "api",
+		Mode:   ModeThrottled,
 	})
 	after := time.Now().UTC()
 
@@ -90,7 +90,7 @@ func TestLogger_ConcurrentSafe(t *testing.T) {
 					Method:    "POST",
 					Path:      "/v1/messages",
 					Status:    200,
-					Mode:      "oauth",
+					Mode:      ModeActive,
 					LatencyMS: int64(id*perGoroutine + j),
 				})
 			}

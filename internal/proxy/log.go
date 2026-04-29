@@ -10,13 +10,12 @@ import (
 // LogEntry holds metadata for a single proxied request. It deliberately omits
 // credentials, request bodies, and full headers to avoid leaking secrets.
 type LogEntry struct {
-	TS                 time.Time `json:"ts"`
-	Method             string    `json:"method"`
-	Path               string    `json:"path"`
-	Status             int       `json:"status"`
-	Mode               string    `json:"mode"`
-	LatencyMS          int64     `json:"latency_ms"`
-	RatelimitRemaining string    `json:"ratelimit_remaining,omitempty"`
+	TS        time.Time `json:"ts"`
+	Method    string    `json:"method"`
+	Path      string    `json:"path"`
+	Status    int       `json:"status"`
+	Mode      Mode      `json:"mode"`
+	LatencyMS int64     `json:"latency_ms"`
 }
 
 // Logger writes one JSON object per line to w. All writes are serialized via

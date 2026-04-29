@@ -342,6 +342,40 @@ func TestIntegration_StatusEndpointBypassesProxy(t *testing.T) {
 	}
 }
 
+// --- Test: log mode reflects Director's read ---
+
+// TestIntegration_LogModeMatchesDirectorDecision verifies the per-request log
+// entry's Mode field is populated from the value the Director observed at
+// routing-decision time, not from a fresh state read at log time. This pins
+// down the contract that the wrapping handler installs a captureMode slot and
+// the Director writes through it.
+func TestIntegration_LogModeMatchesDirectorDecision(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	state := NewState()
+	state.EnterThrottled(time.Now().Add(1*time.Hour), "test", 429)
+
+	var logBuf strings.Builder
+	proxy := buildProxy(t, upstream.URL, state, NewLogger(&logBuf))
+	defer proxy.Close()
+
+	resp := doRequest(t, http.MethodPost, proxy.URL+"/v1/messages", map[string]string{
+		"Authorization": "Bearer real-token",
+	})
+	resp.Body.Close()
+
+	var entry LogEntry
+	if err := json.Unmarshal([]byte(strings.TrimSpace(logBuf.String())), &entry); err != nil {
+		t.Fatalf("decode log entry: %v\nraw: %q", err, logBuf.String())
+	}
+	if entry.Mode != ModeThrottled {
+		t.Errorf("log Mode = %q, want %q", entry.Mode, ModeThrottled)
+	}
+}
+
 // --- Test 8 ---
 
 // TestIntegration_LazyRecoveryAfterReset verifies that after the throttle deadline
