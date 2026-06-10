@@ -49,6 +49,10 @@ run() {
 
 case "${1:-}" in
   session-start)
+    # Register the logged-in account on first sight, so a fresh /login joins
+    # the pool without a manual import. (stdout suppressed: SessionStart
+    # stdout is injected into Claude's context.)
+    "$POOL" import --if-missing >/dev/null 2>&1
     run auto --if-needed --threshold 0.9
     ;;
   background)

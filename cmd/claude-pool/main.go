@@ -69,6 +69,7 @@ func usage() {
 Usage:
   claude-pool import [--id NAME]      Save the account currently logged into cc
                                       (default name: email user, else timestamp)
+        --if-missing        Silent no-op unless the credential is new (for hooks)
   claude-pool key add [--id NAME] [KEY]
                                       Register an API key (omit KEY to read
                                       stdin; default name: timestamp)
@@ -259,23 +260,65 @@ func harvest(s *pool.Store) {
 func cmdImport(args []string) error {
 	fs := newFlagSet("import")
 	id := fs.String("id", "", "name for this account (default: email user / timestamp)")
+	ifMissing := fs.Bool("if-missing", false, "import only when the Keychain credential is not in the pool; silent no-op otherwise (for hooks)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
 	blob, err := pool.ReadKeychain()
 	if err != nil {
+		if *ifMissing {
+			return nil
+		}
 		return err
 	}
 	if blob == "" {
+		if *ifMissing {
+			return nil
+		}
 		return fmt.Errorf("no Claude Code credentials found; log in with `claude` first")
 	}
 	od, err := pool.ParseBlob(blob)
 	if err != nil {
+		if *ifMissing {
+			return nil
+		}
 		return fmt.Errorf("current credential is not a valid OAuth blob: %w", err)
 	}
-	email, err := pool.FetchProfile(od.AccessToken)
-	if err != nil {
+
+	var email string
+	if *ifMissing {
+		s0, err := pool.Load()
+		if err != nil {
+			return nil
+		}
+		// In apikey mode the Keychain holds the last (exhausted) account —
+		// importing it would yank cc out of the fallback.
+		if s0.Mode == pool.ModeAPIKey {
+			return nil
+		}
+		for _, a := range s0.Accounts {
+			if a.Blob == blob {
+				return nil // already registered with the freshest credential
+			}
+		}
+		if email, err = pool.FetchProfile(od.AccessToken); err != nil || email == "" {
+			return nil // can't attribute: skip rather than risk a duplicate entry
+		}
+		for _, a := range s0.Accounts {
+			if a.Email == email {
+				// known account whose credential cc refreshed: fold it in quietly
+				_, err := pool.LockedUpdate(func(st *pool.Store) error {
+					if e := st.Find(a.ID); e != nil {
+						e.Blob = blob
+					}
+					return nil
+				})
+				return err
+			}
+		}
+		// genuinely new account: fall through to a normal import
+	} else if email, err = pool.FetchProfile(od.AccessToken); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not fetch account identity (%v); cc-side refreshes of this account won't be auto-harvested\n", err)
 	}
 

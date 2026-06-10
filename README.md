@@ -96,7 +96,7 @@ This repo doubles as a Claude Code plugin that ships the swap hooks preconfigure
 On the first session start the plugin bootstraps the binary with `go install` automatically (requires a Go toolchain); everything else works out of the box. The plugin wires three hooks:
 
 - **StopFailure / rate_limit** — reactive: the turn just died on a rate limit; swap immediately so the next attempt uses a fresh credential.
-- **SessionStart** — proactive: start each session on the account with the most headroom.
+- **SessionStart** — proactive: start each session on the account with the most headroom. Also auto-imports a freshly logged-in account into the pool (`import --if-missing`), so `/login` is all a new account needs.
 - **UserPromptSubmit** — proactive, fire-and-forget: keeps the pool balanced mid-session without delaying the prompt.
 
 `auto` is a silent no-op while the pool is empty, so the plugin is safe to install before importing any accounts.
