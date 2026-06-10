@@ -1,0 +1,12 @@
+{
+  "name": "claude-pool",
+  "version": "0.1.0",
+  "description": "Pool multiple Claude subscription accounts (+ API key fallback) and auto-swap Claude Code's credential on rate limits",
+  "author": {
+    "name": "unsafe9",
+    "email": "rhfhzp001@gmail.com"
+  },
+  "repository": "https://github.com/unsafe9/claude-pool",
+  "license": "MIT",
+  "keywords": ["accounts", "rate-limit", "credentials", "hooks", "macos"]
+}

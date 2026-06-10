@@ -1,0 +1,13 @@
+{
+  "name": "claude-pool",
+  "owner": {
+    "name": "unsafe9"
+  },
+  "plugins": [
+    {
+      "name": "claude-pool",
+      "source": "./",
+      "description": "Pool multiple Claude subscription accounts (+ API key fallback) and auto-swap Claude Code's credential on rate limits"
+    }
+  ]
+}
