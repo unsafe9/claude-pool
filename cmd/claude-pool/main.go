@@ -11,6 +11,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"math"
@@ -69,12 +70,12 @@ func usage() {
 Usage:
   claude-pool import [--id NAME]      Save the account currently logged into cc
                                       (default name: email user, else timestamp)
-        --if-missing        Silent no-op unless the credential is new (for hooks)
   claude-pool key add [--id NAME] [KEY]
                                       Register an API key (omit KEY to read
                                       stdin; default name: timestamp)
   claude-pool rm <id>                 Remove an account or API key
-  claude-pool list                    Show accounts (with 5h/7d usage) and keys
+  claude-pool list [--json]           Show accounts (with 5h/7d usage) and keys;
+                                      --json dumps pool state (no network/secrets)
   claude-pool switch <id>             Switch to a specific account
   claude-pool auto [flags] [-- cc-args]
                                       Pick the least-used account; if every
@@ -260,65 +261,23 @@ func harvest(s *pool.Store) {
 func cmdImport(args []string) error {
 	fs := newFlagSet("import")
 	id := fs.String("id", "", "name for this account (default: email user / timestamp)")
-	ifMissing := fs.Bool("if-missing", false, "import only when the Keychain credential is not in the pool; silent no-op otherwise (for hooks)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
 	blob, err := pool.ReadKeychain()
 	if err != nil {
-		if *ifMissing {
-			return nil
-		}
 		return err
 	}
 	if blob == "" {
-		if *ifMissing {
-			return nil
-		}
 		return fmt.Errorf("no Claude Code credentials found; log in with `claude` first")
 	}
 	od, err := pool.ParseBlob(blob)
 	if err != nil {
-		if *ifMissing {
-			return nil
-		}
 		return fmt.Errorf("current credential is not a valid OAuth blob: %w", err)
 	}
-
-	var email string
-	if *ifMissing {
-		s0, err := pool.Load()
-		if err != nil {
-			return nil
-		}
-		// In apikey mode the Keychain holds the last (exhausted) account —
-		// importing it would yank cc out of the fallback.
-		if s0.Mode == pool.ModeAPIKey {
-			return nil
-		}
-		for _, a := range s0.Accounts {
-			if a.Blob == blob {
-				return nil // already registered with the freshest credential
-			}
-		}
-		if email, err = pool.FetchProfile(od.AccessToken); err != nil || email == "" {
-			return nil // can't attribute: skip rather than risk a duplicate entry
-		}
-		for _, a := range s0.Accounts {
-			if a.Email == email {
-				// known account whose credential cc refreshed: fold it in quietly
-				_, err := pool.LockedUpdate(func(st *pool.Store) error {
-					if e := st.Find(a.ID); e != nil {
-						e.Blob = blob
-					}
-					return nil
-				})
-				return err
-			}
-		}
-		// genuinely new account: fall through to a normal import
-	} else if email, err = pool.FetchProfile(od.AccessToken); err != nil {
+	email, err := pool.FetchProfile(od.AccessToken)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: could not fetch account identity (%v); cc-side refreshes of this account won't be auto-harvested\n", err)
 	}
 
@@ -435,10 +394,47 @@ func cmdRemove(args []string) error {
 }
 
 func cmdList(args []string) error {
+	fs := newFlagSet("list")
+	asJSON := fs.Bool("json", false, "machine-readable pool state: no usage polling, no secrets")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
 	s, err := pool.Load()
 	if err != nil {
 		return err
 	}
+
+	if *asJSON {
+		type entry struct {
+			ID    string `json:"id"`
+			Email string `json:"email,omitempty"`
+		}
+		out := struct {
+			Mode       string  `json:"mode"`
+			Current    string  `json:"current"`
+			CurrentKey string  `json:"current_key,omitempty"`
+			Accounts   []entry `json:"accounts"`
+			APIKeys    []entry `json:"api_keys"`
+		}{
+			Mode:       s.Mode,
+			Current:    s.Current,
+			CurrentKey: s.CurrentKey,
+			Accounts:   []entry{},
+			APIKeys:    []entry{},
+		}
+		if out.Mode == "" {
+			out.Mode = pool.ModeAccount
+		}
+		for _, a := range s.Accounts {
+			out.Accounts = append(out.Accounts, entry{ID: a.ID, Email: a.Email})
+		}
+		for _, k := range s.APIKeys {
+			out.APIKeys = append(out.APIKeys, entry{ID: k.ID})
+		}
+		return json.NewEncoder(os.Stdout).Encode(out)
+	}
+
 	if len(s.Accounts) == 0 && len(s.APIKeys) == 0 {
 		fmt.Println("empty pool; run `claude-pool import --id NAME` and/or `claude-pool key add --id NAME`")
 		return nil
