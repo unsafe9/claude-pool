@@ -78,9 +78,11 @@ claude-pool auto --launch -- --continue        # switch, then exec `claude --con
 claude-pool list           # accounts with live 5h/7d usage, then keys
 claude-pool switch work    # switch to a specific account
 claude-pool rm console1    # remove an account or API key
-claude-pool statusline     # "personal 4%/4h40m 2%/6d8h" for statusline scripts
+claude-pool current        # active auth profile: "work", or "key:console1" in API-key mode
 claude-pool helper         # apiKeyHelper hook for cc (managed by auto, not for manual use)
 ```
+
+`current` is network-free, so a custom statusline script can call it on every render to show which auth profile is active — usage and reset times for the current credential are already exposed to statusline scripts by Claude Code itself (`.rate_limits`).
 
 ## Hook-driven swapping
 

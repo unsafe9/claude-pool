@@ -89,22 +89,9 @@ func mkWindow(util float64, resetsAt string) Window {
 // FormatStatusline renders the compact form "4%/4h40m 2%/6d8h": for each window
 // the floored utilization percent and the time until reset.
 func (u Usage) FormatStatusline(now time.Time) string {
-	return u.formatStatusline(now, "", "", "")
-}
-
-// FormatStatuslineANSI is FormatStatusline with the percentages in bright
-// yellow and the reset times in gray — the same scheme as cc statusline
-// scripts that render rate limits.
-func (u Usage) FormatStatuslineANSI(now time.Time) string {
-	return u.formatStatusline(now, "\033[93m", "\033[90m", "\033[0m")
-}
-
-func (u Usage) formatStatusline(now time.Time, pctC, durC, reset string) string {
-	return fmt.Sprintf("%s%d%%%s/%s%s%s %s%d%%%s/%s%s%s",
-		pctC, int(math.Floor(u.FiveHour.Pct)), reset,
-		durC, shortDur(u.FiveHour.ResetsAt.Sub(now), false), reset,
-		pctC, int(math.Floor(u.SevenDay.Pct)), reset,
-		durC, shortDur(u.SevenDay.ResetsAt.Sub(now), true), reset)
+	return fmt.Sprintf("%d%%/%s %d%%/%s",
+		int(math.Floor(u.FiveHour.Pct)), shortDur(u.FiveHour.ResetsAt.Sub(now), false),
+		int(math.Floor(u.SevenDay.Pct)), shortDur(u.SevenDay.ResetsAt.Sub(now), true))
 }
 
 // shortDur formats a duration as "6d8h" (days mode), "4h40m", or "40m".

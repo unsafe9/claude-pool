@@ -45,8 +45,8 @@ func main() {
 		err = cmdAuto(os.Args[2:])
 	case "helper":
 		err = cmdHelper()
-	case "statusline":
-		err = cmdStatusline()
+	case "current":
+		err = cmdCurrent()
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -83,7 +83,8 @@ Usage:
         --threshold 0.0-1.0 Binding-utilization trigger for --if-needed (default 0.8)
         --launch            Exec `+"`claude`"+` after switching (pass cc args after --)
   claude-pool helper                  apiKeyHelper hook for cc (managed by auto)
-  claude-pool statusline              Print "<id> 4%/4h40m 2%/6d8h" for the active account
+  claude-pool current                 Print the active auth profile ("work", or
+                                      "key:NAME" in API-key mode); no network
 
 Add accounts: log into cc with each account, then run `+"`import --id NAME`"+` each time.
 `)
@@ -777,7 +778,10 @@ func probeRecovery() {
 		best.ID, bestScore)
 }
 
-func cmdStatusline() error {
+// cmdCurrent prints the active auth profile — the account ID, or "key:NAME"
+// in API-key mode — from the store alone, no network: cheap enough to call
+// from a statusline script on every render.
+func cmdCurrent() error {
 	s, err := pool.Load()
 	if err != nil {
 		return err
@@ -786,15 +790,9 @@ func cmdStatusline() error {
 		fmt.Printf("key:%s\n", s.CurrentKey)
 		return nil
 	}
-	cur := s.Find(s.Current)
-	if cur == nil {
-		return fmt.Errorf("no active account")
+	if s.Current != "" {
+		fmt.Println(s.Current)
 	}
-	u, err := usageFor(s, cur)
-	if err != nil {
-		return err
-	}
-	fmt.Printf("%s %s\n", cur.ID, u.FormatStatuslineANSI(time.Now()))
 	return nil
 }
 

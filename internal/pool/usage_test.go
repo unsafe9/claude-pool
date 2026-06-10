@@ -16,12 +16,6 @@ func TestFormatStatusline_MatchesCompactForm(t *testing.T) {
 	if got != want {
 		t.Errorf("FormatStatusline = %q, want %q", got, want)
 	}
-
-	gotANSI := u.FormatStatuslineANSI(now)
-	wantANSI := "\033[93m4%\033[0m/\033[90m4h40m\033[0m \033[93m2%\033[0m/\033[90m6d8h\033[0m"
-	if gotANSI != wantANSI {
-		t.Errorf("FormatStatuslineANSI = %q, want %q", gotANSI, wantANSI)
-	}
 }
 
 func TestShortDur(t *testing.T) {
