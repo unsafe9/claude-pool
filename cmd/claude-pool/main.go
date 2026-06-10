@@ -774,12 +774,15 @@ func stillExhausted(a *pool.Account, now time.Time) bool {
 
 // cacheUsages persists each successfully-polled account's usage into the store,
 // keyed by ID. usages/errs are indexed parallel to s.Accounts (pollAccounts'
-// alignment). MUST run on the main goroutine only — after pollAccounts has
-// joined — since it write-backs via s.Update (the lock-and-replace path is not
-// safe to call from a pollAccounts goroutine).
+// alignment). It persists via LockedUpdate WITHOUT writing back into the
+// caller's s: s.Update would replace s.Accounts with a fresh disk load (a
+// possibly different length if another process added/removed an account), which
+// would leave the subsequent bestAccount / list print loop indexing usages/errs
+// out of range. The current pass already holds the live results; only future
+// processes read the cache. Call on the main goroutine, after pollAccounts joins.
 func cacheUsages(s *pool.Store, usages []pool.Usage, errs []error) {
 	now := time.Now()
-	_ = s.Update(func(st *pool.Store) error {
+	_, _ = pool.LockedUpdate(func(st *pool.Store) error {
 		for i, a := range s.Accounts {
 			if errs[i] != nil {
 				continue
