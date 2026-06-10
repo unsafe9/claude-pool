@@ -108,5 +108,5 @@ func shortDur(d time.Duration, days bool) string {
 	if h := totalMin / 60; h > 0 {
 		return fmt.Sprintf("%dh%dm", h, totalMin%60)
 	}
-	return fmt.Sprintf("%dm", totalMin%60)
+	return fmt.Sprintf("%dm", totalMin)
 }

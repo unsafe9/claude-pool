@@ -19,7 +19,18 @@ const (
 // (the SessionStart hook runs with a 15s timeout); polls now run concurrently,
 // so worst case is one refresh + one usage call ≈ 16s only on a fully dead
 // network.
-var httpClient = &http.Client{Timeout: 8 * time.Second}
+var httpClient = &http.Client{Timeout: 8 * time.Second, Transport: poolTransport()}
+
+// poolTransport clones the default transport and raises the per-host connection
+// limits: pollAccounts fans out concurrently and several accounts hit the same
+// host (api/console.anthropic.com), so the default MaxIdleConnsPerHost of 2
+// would force extra TLS handshakes.
+func poolTransport() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConnsPerHost = 32
+	t.MaxConnsPerHost = 32
+	return t
+}
 
 // Refresh exchanges the blob's refresh token for a fresh access token and
 // returns an updated blob. The returned bool is false when no refresh happened

@@ -23,7 +23,8 @@ func RunningSessions() []int {
 	if err != nil {
 		return nil
 	}
-	entries, err := os.ReadDir(filepath.Join(home, ".claude", "sessions"))
+	dir := filepath.Join(home, ".claude", "sessions")
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
 	}
@@ -32,7 +33,7 @@ func RunningSessions() []int {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(home, ".claude", "sessions", e.Name()))
+		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
 		if err != nil {
 			continue
 		}

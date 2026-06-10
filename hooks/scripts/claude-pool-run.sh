@@ -52,7 +52,8 @@ case "${1:-}" in
     # First run on a logged-in machine: an empty pool has nothing to manage,
     # so register the current Keychain credential. (stdout suppressed:
     # SessionStart stdout is injected into Claude's context.)
-    if "$POOL" list --json 2>/dev/null | grep -q '"accounts":\[\]'; then
+    pooljson="$("$POOL" list --json 2>/dev/null)"
+    if printf '%s' "$pooljson" | grep -q '"accounts":\[\]' && printf '%s' "$pooljson" | grep -q '"api_keys":\[\]'; then
       "$POOL" import >/dev/null 2>&1
     fi
     run auto --if-needed --threshold 0.9
