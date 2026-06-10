@@ -468,6 +468,7 @@ func cmdList(args []string) error {
 	}
 	now := time.Now()
 	usages, errs := pollAccounts(s, nil)
+	cacheUsages(s, usages, errs)
 	for i, a := range s.Accounts {
 		marker := "  "
 		if a.ID == s.Current && s.Mode != pool.ModeAPIKey {
@@ -527,6 +528,7 @@ func cmdAuto(args []string) error {
 	if err != nil {
 		return err
 	}
+	now := time.Now()
 
 	// --launch always execs claude: a pool failure must not block cc from
 	// starting on whatever credential it already holds.
@@ -580,8 +582,29 @@ func cmdAuto(args []string) error {
 		}
 	}
 
+	// While in API-key mode the accounts aren't being used, so their utilization
+	// can't change until a window resets. If every account is provably still
+	// exhausted (cached and not yet past its reset), there is nothing to recover
+	// yet — skip the poll entirely. Re-poll only once some reset has passed.
+	// This is sound ONLY in apikey mode; in account mode the current account IS
+	// being used, so its utilization rises over time — hence the fast path above
+	// keeps polling it.
+	if s.Mode == pool.ModeAPIKey {
+		allStillExhausted := true
+		for _, a := range s.Accounts {
+			if !stillExhausted(a, now) {
+				allStillExhausted = false
+				break
+			}
+		}
+		if allStillExhausted {
+			return finish(nil)
+		}
+	}
+
 	// Full pass: poll every account concurrently, reusing the fast-path poll.
 	usages, errs := pollAccounts(s, curUsage)
+	cacheUsages(s, usages, errs)
 	best, bestScore, polled := bestAccount(s, usages, errs)
 
 	switch {
@@ -735,6 +758,40 @@ func startDetached(cmd *exec.Cmd) error {
 		return err
 	}
 	return cmd.Process.Release()
+}
+
+// stillExhausted reports whether a's cached usage PROVES it is still exhausted
+// at now — i.e. we have a cached usage, it pins down a reset time, and now has
+// not reached it yet. A cache miss (nil Usage) or an unknown reset (usableAt
+// returns zero) yields false, so the caller falls back to polling.
+func stillExhausted(a *pool.Account, now time.Time) bool {
+	if a.Usage == nil {
+		return false
+	}
+	t := usableAt(*a.Usage)
+	return !t.IsZero() && now.Before(t)
+}
+
+// cacheUsages persists each successfully-polled account's usage into the store,
+// keyed by ID. usages/errs are indexed parallel to s.Accounts (pollAccounts'
+// alignment). MUST run on the main goroutine only — after pollAccounts has
+// joined — since it write-backs via s.Update (the lock-and-replace path is not
+// safe to call from a pollAccounts goroutine).
+func cacheUsages(s *pool.Store, usages []pool.Usage, errs []error) {
+	now := time.Now()
+	_ = s.Update(func(st *pool.Store) error {
+		for i, a := range s.Accounts {
+			if errs[i] != nil {
+				continue
+			}
+			if e := st.Find(a.ID); e != nil {
+				u := usages[i]
+				e.Usage = &u
+				e.UsageAt = now
+			}
+		}
+		return nil
+	})
 }
 
 // usableAt is the moment u's exhausted windows have all reset — zero when the

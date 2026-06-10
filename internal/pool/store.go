@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 )
 
 // Account is one stored Claude subscription account. Blob is the exact
@@ -16,6 +17,9 @@ type Account struct {
 	ID    string `json:"id"`
 	Email string `json:"email,omitempty"`
 	Blob  string `json:"blob"`
+
+	Usage   *Usage    `json:"usage,omitempty"`    // last polled usage (cache)
+	UsageAt time.Time `json:"usage_at,omitempty"` // when Usage was fetched
 }
 
 // APIKey is one stored Anthropic API key, used only after every subscription

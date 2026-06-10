@@ -14,14 +14,14 @@ import (
 // (0..100) and resets_at as RFC3339 — unlike the response *headers*, which use
 // a 0..1 fraction and epoch seconds.
 type Window struct {
-	Pct      float64
-	ResetsAt time.Time
+	Pct      float64   `json:"pct"`
+	ResetsAt time.Time `json:"resets_at"`
 }
 
 // Usage is the 5-hour and 7-day rate-limit state for a subscription account.
 type Usage struct {
-	FiveHour Window
-	SevenDay Window
+	FiveHour Window `json:"five_hour"`
+	SevenDay Window `json:"seven_day"`
 }
 
 // Score is the binding utilization (0..100): the more-constrained of the two
