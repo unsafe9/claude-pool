@@ -1,132 +1,111 @@
-# claude-code-proxy
+# claude-pool
 
-A local Go reverse proxy for [Claude Code](https://github.com/anthropics/claude-code). It forwards your cc OAuth subscription traffic to `api.anthropic.com` unchanged, and on hitting your 5-hour / 7-day Claude Pro/Max rate limits, automatically falls back to a pre-registered Anthropic API key — only for generation endpoints, keeping every other call (token refresh, profile, usage) on OAuth so cc keeps working normally.
+Credential pooler for [Claude Code](https://github.com/anthropics/claude-code) on macOS. Pools multiple Claude subscription accounts — plus Anthropic API keys as a last resort — and automatically keeps Claude Code on whichever credential has the most rate-limit headroom.
+
+No proxy, no man-in-the-middle: Claude Code talks to `api.anthropic.com` directly. claude-pool only manages which credential it holds.
 
 ## How it works
 
-All Claude Code HTTP traffic flows through `http://127.0.0.1:8787` (the proxy) on its way to `https://api.anthropic.com`. The proxy rewrites the scheme and host on every request, then returns the upstream response verbatim — with one exception: when a rate limit is detected, it begins swapping the `Authorization: Bearer` header for `X-Api-Key` on eligible paths.
-
-The header swap is path-gated. Only paths that begin with `/v1/` and do **not** begin with `/v1/oauth/` are eligible. In practice this means `/v1/messages`, `/v1/messages/count_tokens`, and similar generation endpoints get the fallback key while OAuth-managed paths stay untouched.
-
-The proxy drives a two-state machine. In `active` mode every request passes through with the original OAuth token. When an upstream response comes back as HTTP 429 carrying a rate-limit signal — either an `Anthropic-Ratelimit-Unified-5h-Reset` or `Anthropic-Ratelimit-Unified-7d-Reset` header (or any of the standard per-resource reset headers), a `Retry-After` header, or a body with `error.type` of `rate_limit_error` / `usage_limit_*` — the proxy transitions to `throttled` mode and records the reset deadline. Once the deadline passes the proxy recovers lazily: the next incoming request checks the clock, finds the deadline expired, and flips back to `active` automatically.
+- **Account mode** (the default, preferred state): the chosen account's OAuth credential is written into the macOS Keychain item Claude Code reads (`Claude Code-credentials`). Expiring tokens are refreshed before use.
+- **Selection**: each account is scored by its *binding utilization* — `max(5-hour %, 7-day %)` from the subscription usage API (`/api/oauth/usage`). `auto` polls all accounts concurrently and activates the one with the lowest score.
+- **API-key fallback**: accounts always win. Only when *every* successfully polled account sits at 100% does `auto` flip to API keys, by setting `apiKeyHelper` in `~/.claude/settings.json` — `apiKeyHelper` outranks the Keychain OAuth credential in Claude Code's documented [authentication precedence](https://code.claude.com/docs/en/authentication.md#authentication-precedence), and settings changes hot-reload into running sessions. The helper round-robins across registered keys on each invocation.
+- **Recovery**: API-key time is billed time, so leaving it is aggressive. Three triggers race to get you back on subscription auth the moment any account resets below 100%:
+  1. every `auto` run (hooks) re-polls all accounts while in API-key mode;
+  2. the helper itself probes the accounts each time Claude Code asks it for a key — i.e. exactly when money is about to be spent — and switches back on the spot (the key it prints bridges only the in-flight request);
+  3. on entering API-key mode, a detached one-shot is scheduled for the earliest known window reset (from the usage API's `resets_at`) and re-runs `auto` right after it.
 
 ```
-active ──[429 + rate-limit signal]──► throttled(until=T)
-                                              │
-                                              └──[first request after T]──► active
+account mode ──(every account at 100%)──▶ API-key mode
+account mode ◀──(any account resets)───── API-key mode
 ```
 
-## Quick start
+- **Errors are not exhaustion**: an account whose usage poll fails is skipped, not treated as exhausted — and if every poll fails, `auto` stays on the current credential instead of dumping you onto API keys over a network blip.
+- **Self-healing**: every run reconciles the store, settings, and Keychain. Hand-deleting the `apiKeyHelper` is respected. A credential that Claude Code itself refreshed in the Keychain is harvested back into the pool (attributed to the right account by email via the profile API). A foreign `apiKeyHelper` you already had is preserved and restored when claude-pool leaves API-key mode.
+
+State lives in `~/.config/claude-pool/pool.json` (mode 0600), flock-protected against concurrent hook/helper runs.
+
+## Installation
 
 ```bash
-# Build the binary
-make build                               # produces ./bin/claudeproxy
-
-# Set your fallback API key (get one at console.anthropic.com)
-export ANTHROPIC_FALLBACK_API_KEY=sk-ant-...
-
-# Start the proxy (binds to 127.0.0.1:8787)
-./bin/claudeproxy &
-
-# Point Claude Code at the proxy and use it normally
-ANTHROPIC_BASE_URL=http://localhost:8787 claude
+go install github.com/unsafe9/claude-pool/cmd/claude-pool@latest
 ```
 
-Before using the proxy, make sure you have logged in with Claude Code's own OAuth flow at least once:
+Or from source:
 
 ```bash
-claude login
+git clone https://github.com/unsafe9/claude-pool.git
+cd claude-pool
+make install   # = go install ./cmd/claude-pool
 ```
 
-Your OAuth credentials are stored by cc in `~/.claude/.credentials.json` and refreshed automatically. The proxy never touches them.
+`go install` places the binary in `$GOBIN` (default `~/go/bin`). Installing the binary by hand is optional — the plugin below bootstraps it automatically on first session start.
 
-## Configuration
+## Usage
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `PROXY_PORT` | `8787` | Listening port (bound to `127.0.0.1` only) |
-| `ANTHROPIC_FALLBACK_API_KEY` | (empty) | Empty = fallback disabled; throttle just forwards 429 |
-| `UPSTREAM_URL` | `https://api.anthropic.com` | For testing/debugging with a mock upstream |
+### Add accounts
 
-`LOG_LEVEL` is reserved for future use and currently has no effect.
-
-## Status endpoint
-
-The proxy exposes a read-only status endpoint that never reaches upstream:
+Log into Claude Code with each account, importing after each login:
 
 ```bash
-curl -s http://localhost:8787/status | jq
+claude-pool import                 # auto-named after the account email (or a timestamp)
+# /login with the next account, then:
+claude-pool import --id work       # or name it yourself
 ```
 
-Normal operation:
+Importing also makes that account the active one. Re-importing the same account (same `--id`, or auto-named by the same email) refreshes the stored credential without creating a duplicate.
 
-```json
-{
-  "mode": "active",
-  "request_count": 42,
-  "fallback_count": 0
-}
+### Register fallback API keys (optional)
+
+```bash
+claude-pool key add                            # auto-named key-YYYYMMDD-HHMMSS, key via stdin
+claude-pool key add --id console2 sk-ant-...
 ```
 
-During throttle (fallback active):
+### Automatic switching
 
-```json
-{
-  "mode": "throttled",
-  "throttled_until": "2026-04-29T22:00:00Z",
-  "last_trigger_at": "2026-04-29T17:30:00Z",
-  "last_trigger_code": 429,
-  "last_trigger_src": "Anthropic-Ratelimit-Unified-5h-Reset",
-  "request_count": 158,
-  "fallback_count": 12
-}
+```bash
+claude-pool auto                               # pick the least-used account / fall back / recover
+claude-pool auto --if-needed --threshold 0.9   # cheap path: poll only the current account,
+                                               # act only if it is past 90% (default 0.8)
+claude-pool auto --launch -- --continue        # switch, then exec `claude --continue`
 ```
 
-## Header swap rule
+`--launch` always execs `claude` afterwards, even if the pool step failed — a pool error never blocks Claude Code from starting on whatever credential it already holds.
 
-**Swap target** — when `mode == throttled` and `ANTHROPIC_FALLBACK_API_KEY` is set, the proxy removes the `Authorization: Bearer <token>` header and sets `X-Api-Key: <fallback-key>` on any path that satisfies both conditions:
+### Other commands
 
-1. Path starts with `/v1/`
-2. Path does **not** start with `/v1/oauth/`
+```bash
+claude-pool list           # accounts with live 5h/7d usage, then keys
+claude-pool switch work    # switch to a specific account
+claude-pool rm console1    # remove an account or API key
+claude-pool statusline     # "personal 4%/4h40m 2%/6d8h" for statusline scripts
+claude-pool helper         # apiKeyHelper hook for cc (managed by auto, not for manual use)
+```
 
-This covers `/v1/messages`, `/v1/messages/count_tokens`, and any future generation endpoints under `/v1/`.
+## Hook-driven swapping
 
-**Pass-through (no header change)** even during throttle:
+This repo doubles as a Claude Code plugin that ships the swap hooks preconfigured. In Claude Code:
 
-- `/v1/oauth/token` — cc's OAuth token refresh; must stay Bearer or the refresh fails
-- `/api/oauth/profile`, `/api/oauth/usage` — cc UI's account info and usage display; these are OAuth-only and would return 401 with an API key
-- `/status` — the proxy's own status endpoint; never reaches upstream at all
+```
+/plugin marketplace add unsafe9/claude-pool
+/plugin install claude-pool@claude-pool
+```
 
-## What stays normal during fallback
+On the first session start the plugin bootstraps the binary with `go install` automatically (requires a Go toolchain); everything else works out of the box. The plugin wires three hooks:
 
-- **cc UI's 5h/7d usage display** — cc reads it from `/api/oauth/usage`, which the proxy never swaps headers on. The bar and countdown keep reflecting your subscription usage accurately.
-- **cc OAuth token refresh** — token refreshes go to `https://platform.claude.com/v1/oauth/token` (a different domain), so they never even traverse this proxy.
+- **StopFailure / rate_limit** — reactive: the turn just died on a rate limit; swap immediately so the next attempt uses a fresh credential.
+- **SessionStart** — proactive: start each session on the account with the most headroom.
+- **UserPromptSubmit** — proactive, fire-and-forget: keeps the pool balanced mid-session without delaying the prompt.
 
-## Troubleshooting
+`auto` is a silent no-op while the pool is empty, so the plugin is safe to install before importing any accounts.
 
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| 401 from cc during fallback | API key invalid or expired | Update `ANTHROPIC_FALLBACK_API_KEY` and restart the proxy |
-| Port already in use | Another process is bound to 8787 | `PROXY_PORT=9999 ./bin/claudeproxy` |
-| Streaming response cut off mid-stream | Anthropic returned 429 mid-SSE | Expected — the in-flight request is dropped; cc retries on the next request, which already uses the fallback key |
-| OAuth 401 in `active` mode | cc OAuth token expired | Run `claude login` to refresh |
+## Caveats
 
-## Limitations / Non-goals
-
-- Multi-account API key rotation (see [KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude))
-- Account switcher for already-logged-in cc accounts (see [realiti4/claude-swap](https://github.com/realiti4/claude-swap))
-- TUI or web dashboard
-- In-stream fallback swap (the proxy does not replay an in-flight request that hit 429 mid-SSE)
-- Pre-emptive switch on usage threshold — the proxy reacts only to actual 429 responses
-- Self-managed OAuth login or token refresh — cc handles its own OAuth lifecycle entirely
-- Use as a shared or team server — this is a localhost-only, single-user tool
-
-## Credits
-
-This project drew on two prior implementations for validation:
-
-- **[KarpelesLab/teamclaude](https://github.com/KarpelesLab/teamclaude)** — validated the `Authorization` Bearer → `X-Api-Key` swap pattern, the raw pass-through exception for `/v1/oauth/token`, and the `Anthropic-Ratelimit-Unified-{5h,7d}-Reset` header names.
-- **[realiti4/claude-swap](https://github.com/realiti4/claude-swap)** — confirmed the `~/.claude/.credentials.json` credential location and the `/api/oauth/usage` endpoint used by the cc UI.
+- macOS only — credentials move through the `security` CLI and the Keychain.
+- One active credential per machine: all concurrent Claude Code sessions share whatever is in the Keychain. Mid-session pickup of a swap is not guaranteed; restart Claude Code to apply it instantly.
+- The first Keychain access may pop a permission prompt — choose **Always Allow** to avoid future prompts.
+- Toggling API-key mode rewrites `~/.claude/settings.json`. Symlinks are resolved and preserved, but JSON key order is not.
+- Running multiple consumer subscription accounts may sit against Anthropic's consumer terms of service. Use at your own risk.
 
 ## License
 

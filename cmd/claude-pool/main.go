@@ -1,0 +1,823 @@
+// Command claude-pool pools multiple Claude subscription accounts and API
+// keys for Claude Code. Accounts are always preferred: `auto` picks the one
+// with the most rate-limit headroom and writes its credential into the macOS
+// Keychain. Only when every account's binding window is exhausted does it fall
+// back to registered API keys (via cc's apiKeyHelper setting, which outranks
+// the Keychain credential); as soon as any account resets, it switches back.
+//
+// Wire `auto` into cc hooks (StopFailure/rate_limit, SessionStart,
+// UserPromptSubmit) for automatic swapping.
+package main
+
+import (
+	"bufio"
+	"flag"
+	"fmt"
+	"math"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/unsafe9/claude-pool/internal/pool"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(1)
+	}
+	var err error
+	switch os.Args[1] {
+	case "import":
+		err = cmdImport(os.Args[2:])
+	case "key":
+		err = cmdKey(os.Args[2:])
+	case "rm":
+		err = cmdRemove(os.Args[2:])
+	case "list", "ls":
+		err = cmdList(os.Args[2:])
+	case "switch":
+		err = cmdSwitch(os.Args[2:])
+	case "auto":
+		err = cmdAuto(os.Args[2:])
+	case "helper":
+		err = cmdHelper()
+	case "statusline":
+		err = cmdStatusline()
+	case "-h", "--help", "help":
+		usage()
+		return
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
+		usage()
+		// NOTE: never exit 2 — cc hooks treat exit 2 as a blocking error
+		// (UserPromptSubmit would block and erase the user's prompt).
+		os.Exit(1)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		os.Exit(1)
+	}
+}
+
+func usage() {
+	fmt.Fprint(os.Stderr, `claude-pool — pool Claude subscription accounts (+ API key fallback) for Claude Code
+
+Usage:
+  claude-pool import [--id NAME]      Save the account currently logged into cc
+                                      (default name: email user, else timestamp)
+  claude-pool key add [--id NAME] [KEY]
+                                      Register an API key (omit KEY to read
+                                      stdin; default name: timestamp)
+  claude-pool rm <id>                 Remove an account or API key
+  claude-pool list                    Show accounts (with 5h/7d usage) and keys
+  claude-pool switch <id>             Switch to a specific account
+  claude-pool auto [flags] [-- cc-args]
+                                      Pick the least-used account; if every
+                                      account is exhausted, fall back to API
+                                      keys until one resets
+        --if-needed         Only act if the current account is over --threshold
+        --threshold 0.0-1.0 Binding-utilization trigger for --if-needed (default 0.8)
+        --launch            Exec `+"`claude`"+` after switching (pass cc args after --)
+  claude-pool helper                  apiKeyHelper hook for cc (managed by auto)
+  claude-pool statusline              Print "<id> 4%/4h40m 2%/6d8h" for the active account
+
+Add accounts: log into cc with each account, then run `+"`import --id NAME`"+` each time.
+`)
+}
+
+// newFlagSet uses ContinueOnError so a bad flag exits 1 via main's error path
+// — flag.ExitOnError would os.Exit(2), which cc hooks interpret as a blocking
+// error (UserPromptSubmit would erase the prompt).
+func newFlagSet(name string) *flag.FlagSet {
+	return flag.NewFlagSet(name, flag.ContinueOnError)
+}
+
+// ensureFresh refreshes a's token if it is expiring, persisting the rotated
+// credential to the store under lock and — when a is the live account — to the
+// Keychain, so cc is never left holding a refresh token we just consumed.
+func ensureFresh(s *pool.Store, a *pool.Account) (pool.OAuthData, error) {
+	od, err := pool.ParseBlob(a.Blob)
+	if err != nil {
+		return pool.OAuthData{}, fmt.Errorf("account %q: %w", a.ID, err)
+	}
+	if !pool.IsExpired(od.ExpiresAt) {
+		return od, nil
+	}
+	nb, changed, err := pool.Refresh(a.Blob)
+	if err != nil {
+		return od, fmt.Errorf("account %q refresh: %w", a.ID, err)
+	}
+	if !changed {
+		return od, nil
+	}
+	a.Blob = nb
+	if _, err := pool.LockedUpdate(func(st *pool.Store) error {
+		if e := st.Find(a.ID); e != nil {
+			e.Blob = nb
+		}
+		return nil
+	}); err != nil {
+		return od, err
+	}
+	if s.Mode != pool.ModeAPIKey && a.ID == s.Current {
+		if err := pool.WriteKeychain(nb); err != nil {
+			return od, err
+		}
+	}
+	od, _ = pool.ParseBlob(nb)
+	return od, nil
+}
+
+// usageFor is the one token→usage chain shared by list, statusline, and auto.
+func usageFor(s *pool.Store, a *pool.Account) (pool.Usage, error) {
+	od, err := ensureFresh(s, a)
+	if err != nil {
+		return pool.Usage{}, err
+	}
+	return pool.FetchUsage(od.AccessToken)
+}
+
+// helperCommand returns the apiKeyHelper command line for this binary. cc runs
+// the value with /bin/sh, so the path must be shell-quoted.
+func helperCommand() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	return shQuote(exe) + " helper", nil
+}
+
+func shQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// isOurHelper reports whether an apiKeyHelper value is one we installed —
+// matched loosely because the binary path can move between runs.
+func isOurHelper(cmd string) bool {
+	return strings.HasSuffix(cmd, " helper") && strings.Contains(cmd, "claude-pool")
+}
+
+// reconcile repairs the store/settings pair when they have desynced: keys
+// removed out from under apikey mode, our helper hand-deleted or replaced by
+// the user (their edit wins), or a helper left installed by a crashed
+// transition.
+func reconcile(s *pool.Store) error {
+	helper, err := pool.GetAPIKeyHelper()
+	if err != nil {
+		return err
+	}
+	ours := isOurHelper(helper)
+	switch {
+	case s.Mode == pool.ModeAPIKey && len(s.APIKeys) == 0:
+		if ours {
+			if err := pool.RestoreAPIKeyHelper(s.SavedHelper); err != nil {
+				return err
+			}
+		}
+		return demote(s)
+	case s.Mode == pool.ModeAPIKey && !ours:
+		return demote(s)
+	case s.Mode != pool.ModeAPIKey && ours:
+		if err := pool.RestoreAPIKeyHelper(s.SavedHelper); err != nil {
+			return err
+		}
+		return demote(s)
+	}
+	return nil
+}
+
+// demote drops the store back to account mode and clears the saved helper.
+func demote(s *pool.Store) error {
+	ns, err := pool.LockedUpdate(func(st *pool.Store) error {
+		if st.Mode == pool.ModeAPIKey {
+			st.Mode = pool.ModeAccount
+		}
+		st.SavedHelper = ""
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	s.Mode, s.SavedHelper = ns.Mode, ns.SavedHelper
+	return nil
+}
+
+// harvest folds a Keychain credential that cc itself refreshed (or a manual
+// /login into a known account) back into the pool before any decision
+// overwrites it with a stale stored blob. Attribution is by account email via
+// the profile API; an unattributable credential is left untouched.
+func harvest(s *pool.Store) {
+	kc, err := pool.ReadKeychain()
+	if err != nil || kc == "" {
+		return
+	}
+	adopt := func(a *pool.Account) {
+		ns, err := pool.LockedUpdate(func(st *pool.Store) error {
+			if e := st.Find(a.ID); e != nil {
+				e.Blob = kc
+			}
+			if st.Mode != pool.ModeAPIKey {
+				st.Current = a.ID
+			}
+			return nil
+		})
+		if err != nil {
+			return
+		}
+		a.Blob = kc
+		s.Current = ns.Current
+	}
+	for _, a := range s.Accounts {
+		if a.Blob == kc {
+			if s.Mode != pool.ModeAPIKey && s.Current != a.ID {
+				adopt(a)
+			}
+			return
+		}
+	}
+	od, err := pool.ParseBlob(kc)
+	if err != nil {
+		return
+	}
+	email, err := pool.FetchProfile(od.AccessToken)
+	if err != nil || email == "" {
+		return
+	}
+	for _, a := range s.Accounts {
+		if a.Email != "" && a.Email == email {
+			adopt(a)
+			return
+		}
+	}
+}
+
+func cmdImport(args []string) error {
+	fs := newFlagSet("import")
+	id := fs.String("id", "", "name for this account (default: email user / timestamp)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	blob, err := pool.ReadKeychain()
+	if err != nil {
+		return err
+	}
+	if blob == "" {
+		return fmt.Errorf("no Claude Code credentials found; log in with `claude` first")
+	}
+	od, err := pool.ParseBlob(blob)
+	if err != nil {
+		return fmt.Errorf("current credential is not a valid OAuth blob: %w", err)
+	}
+	email, err := pool.FetchProfile(od.AccessToken)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not fetch account identity (%v); cc-side refreshes of this account won't be auto-harvested\n", err)
+	}
+
+	name := *id
+	s, err := pool.LockedUpdate(func(st *pool.Store) error {
+		if name == "" {
+			name = autoAccountID(st, email)
+		}
+		st.Upsert(&pool.Account{ID: name, Email: email, Blob: blob})
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	// The just-logged-in account is what the user wants active — this also
+	// leaves apikey mode if we were in it.
+	if err := useAccount(s, s.Find(name)); err != nil {
+		return err
+	}
+	fmt.Printf("imported current account as %q (%d total)\n", name, len(s.Accounts))
+	return nil
+}
+
+// autoAccountID names an account imported without --id: the email local-part
+// when available (so re-importing the same account refreshes the same entry),
+// falling back to a timestamp. A local-part claimed by a DIFFERENT account
+// gets a timestamp suffix instead of silently overwriting it.
+func autoAccountID(st *pool.Store, email string) string {
+	ts := time.Now().Format("20060102-150405")
+	if email == "" {
+		return "acc-" + ts
+	}
+	for _, a := range st.Accounts {
+		if a.Email == email {
+			return a.ID
+		}
+	}
+	name := strings.SplitN(email, "@", 2)[0]
+	if a := st.Find(name); a != nil && a.Email != email {
+		name += "-" + ts
+	}
+	return name
+}
+
+func cmdKey(args []string) error {
+	if len(args) < 1 || args[0] != "add" {
+		return fmt.Errorf("usage: claude-pool key add --id NAME [KEY]")
+	}
+	fs := newFlagSet("key add")
+	id := fs.String("id", "", "name for this API key (default: timestamp)")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	if *id == "" {
+		*id = "key-" + time.Now().Format("20060102-150405")
+	}
+	if fs.NArg() > 1 {
+		return fmt.Errorf("expected at most one KEY argument, got %d", fs.NArg())
+	}
+
+	key := strings.TrimSpace(fs.Arg(0))
+	if key == "" {
+		fmt.Fprint(os.Stderr, "paste API key: ")
+		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+		if err != nil && line == "" {
+			return fmt.Errorf("read key: %w", err)
+		}
+		key = strings.TrimSpace(line)
+	}
+	if key == "" {
+		return fmt.Errorf("empty API key")
+	}
+
+	s, err := pool.LockedUpdate(func(st *pool.Store) error {
+		st.UpsertKey(&pool.APIKey{ID: *id, Key: key})
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("registered API key %q (%s, %d total)\n", *id, maskKey(key), len(s.APIKeys))
+	return nil
+}
+
+func cmdRemove(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: claude-pool rm <id>")
+	}
+	leftAPIKeyMode := false
+	var saved string
+	if _, err := pool.LockedUpdate(func(st *pool.Store) error {
+		if !st.Remove(args[0]) {
+			return fmt.Errorf("no account or API key %q (see `claude-pool list`)", args[0])
+		}
+		// Removing the last key while it is the active auth source would leave
+		// cc wired to a helper that can only fail.
+		if st.Mode == pool.ModeAPIKey && len(st.APIKeys) == 0 {
+			st.Mode = pool.ModeAccount
+			leftAPIKeyMode, saved = true, st.SavedHelper
+			st.SavedHelper = ""
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if leftAPIKeyMode {
+		if err := pool.RestoreAPIKeyHelper(saved); err != nil {
+			return err
+		}
+		fmt.Fprintln(os.Stderr, "claude-pool: left API key mode (last key removed); cc will use the Keychain account")
+	}
+	fmt.Printf("removed %q\n", args[0])
+	return nil
+}
+
+func cmdList(args []string) error {
+	s, err := pool.Load()
+	if err != nil {
+		return err
+	}
+	if len(s.Accounts) == 0 && len(s.APIKeys) == 0 {
+		fmt.Println("empty pool; run `claude-pool import --id NAME` and/or `claude-pool key add --id NAME`")
+		return nil
+	}
+	now := time.Now()
+	for _, a := range s.Accounts {
+		marker := "  "
+		if a.ID == s.Current && s.Mode != pool.ModeAPIKey {
+			marker = "* "
+		}
+		u, err := usageFor(s, a)
+		if err != nil {
+			fmt.Printf("%s%-16s  (error: %v)\n", marker, a.ID, err)
+			continue
+		}
+		fmt.Printf("%s%-16s  %s\n", marker, a.ID, u.FormatStatusline(now))
+	}
+	for _, k := range s.APIKeys {
+		marker := "  "
+		if k.ID == s.CurrentKey && s.Mode == pool.ModeAPIKey {
+			marker = "* "
+		}
+		fmt.Printf("%skey:%-12s  %s\n", marker, k.ID, maskKey(k.Key))
+	}
+	return nil
+}
+
+func cmdSwitch(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: claude-pool switch <id>")
+	}
+	id := args[0]
+	s, err := pool.Load()
+	if err != nil {
+		return err
+	}
+	a := s.Find(id)
+	if a == nil {
+		return fmt.Errorf("no account %q (see `claude-pool list`)", id)
+	}
+	if _, err := ensureFresh(s, a); err != nil {
+		return err
+	}
+	if err := useAccount(s, a); err != nil {
+		return err
+	}
+	fmt.Printf("switched to %q\n", id)
+	warnRunning()
+	return nil
+}
+
+func cmdAuto(args []string) error {
+	fs := newFlagSet("auto")
+	ifNeeded := fs.Bool("if-needed", false, "only act if the current account is over --threshold")
+	threshold := fs.Float64("threshold", 0.8, "binding-utilization trigger for --if-needed (0.0-1.0)")
+	launch := fs.Bool("launch", false, "exec `claude` after switching")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	ccArgs := fs.Args()
+
+	s, err := pool.Load()
+	if err != nil {
+		return err
+	}
+
+	// --launch always execs claude: a pool failure must not block cc from
+	// starting on whatever credential it already holds.
+	finish := func(err error) error {
+		if *launch {
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "claude-pool:", err)
+			}
+			return execClaude(ccArgs)
+		}
+		return err
+	}
+
+	if err := reconcile(s); err != nil {
+		fmt.Fprintln(os.Stderr, "claude-pool: reconcile:", err)
+	}
+
+	// Empty pool: nothing to manage — silent no-op keeps global hooks quiet.
+	if len(s.Accounts) == 0 && len(s.APIKeys) == 0 {
+		return finish(nil)
+	}
+	// Keys-only pool: nothing to prefer, go straight to the keys.
+	if len(s.Accounts) == 0 {
+		if s.Mode != pool.ModeAPIKey {
+			return finish(enterAPIKeyMode(s))
+		}
+		return finish(nil)
+	}
+
+	harvest(s)
+
+	// Single account with no keys: nothing to switch between (harvest above
+	// still keeps the stored blob in sync with cc's).
+	if len(s.Accounts) == 1 && len(s.APIKeys) == 0 {
+		return finish(nil)
+	}
+
+	// --if-needed fast path (the per-prompt hook case): in account mode, if
+	// the current account is still under the threshold, poll only it and stay
+	// put. In apikey mode there is no fast path — returning to an account the
+	// moment one resets requires polling them all.
+	var curUsage *pool.Usage
+	if *ifNeeded && s.Mode != pool.ModeAPIKey {
+		if cur := s.Find(s.Current); cur != nil {
+			if u, err := usageFor(s, cur); err == nil {
+				if u.Score() < *threshold*100 {
+					return finish(nil)
+				}
+				curUsage = &u
+			}
+		}
+	}
+
+	// Full pass: poll every account concurrently, reusing the fast-path poll.
+	usages, errs := pollAccounts(s, curUsage)
+	best, bestScore, polled := bestAccount(s, usages, errs)
+
+	switch {
+	// Zero information: a network blip must not be mistaken for exhaustion —
+	// stay on whatever credential cc already has.
+	case polled == 0:
+		fmt.Fprintln(os.Stderr, "claude-pool: usage unreachable for every account; keeping current credential")
+		return finish(nil)
+
+	// Some account has headroom (utilization is 0..100; 100 = exhausted):
+	// accounts always win over API keys.
+	case bestScore < 100:
+		prev, prevMode := s.Current, s.Mode
+		if err := useAccount(s, best); err != nil {
+			return finish(err)
+		}
+		if prevMode == pool.ModeAPIKey {
+			fmt.Fprintf(os.Stderr, "claude-pool: account %q has headroom again; left API key mode (%.0f%% used)\n", best.ID, bestScore)
+			warnRunning()
+		} else if best.ID != prev {
+			fmt.Fprintf(os.Stderr, "claude-pool: switched to account %q (%.0f%% used)\n", best.ID, bestScore)
+			warnRunning()
+		}
+		return finish(nil)
+
+	// Every polled account exhausted → API key fallback, if any are registered.
+	case len(s.APIKeys) > 0:
+		if s.Mode != pool.ModeAPIKey {
+			fmt.Fprintln(os.Stderr, "claude-pool: every account is exhausted")
+			if err := enterAPIKeyMode(s); err != nil {
+				return finish(err)
+			}
+			// API-key time is billed time: arrange to leave it the moment the
+			// earliest account window resets, not at the next hook firing.
+			scheduleRecoveryWake(usages, errs)
+		}
+		return finish(nil)
+
+	default:
+		return finish(fmt.Errorf("every account is exhausted and no API keys are registered (`claude-pool key add`)"))
+	}
+}
+
+// pollAccounts fetches every account's usage concurrently. cur, when non-nil,
+// is reused as s.Current's result instead of re-polling it.
+func pollAccounts(s *pool.Store, cur *pool.Usage) ([]pool.Usage, []error) {
+	usages := make([]pool.Usage, len(s.Accounts))
+	errs := make([]error, len(s.Accounts))
+	var wg sync.WaitGroup
+	for i, a := range s.Accounts {
+		if cur != nil && a.ID == s.Current {
+			usages[i] = *cur
+			continue
+		}
+		wg.Add(1)
+		go func(i int, a *pool.Account) {
+			defer wg.Done()
+			u, err := usageFor(s, a)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			usages[i] = u
+		}(i, a)
+	}
+	wg.Wait()
+	return usages, errs
+}
+
+// bestAccount picks the successfully polled account with the most headroom.
+func bestAccount(s *pool.Store, usages []pool.Usage, errs []error) (best *pool.Account, bestScore float64, polled int) {
+	bestScore = math.Inf(1)
+	for i, a := range s.Accounts {
+		if errs[i] != nil {
+			continue
+		}
+		polled++
+		if sc := usages[i].Score(); sc < bestScore {
+			best, bestScore = a, sc
+		}
+	}
+	return best, bestScore, polled
+}
+
+// scheduleRecoveryWake spawns a detached one-shot that re-runs `auto` just
+// after the earliest moment an exhausted account becomes usable again, so
+// leaving API-key mode does not wait for the next hook firing. Best-effort:
+// skipped when no reset time is known, capped so multi-day (7d-bound) resets
+// are left to the hooks and the helper's recovery probe.
+func scheduleRecoveryWake(usages []pool.Usage, errs []error) {
+	now := time.Now()
+	var soonest time.Time
+	for i, u := range usages {
+		if errs[i] != nil {
+			continue
+		}
+		t := usableAt(u)
+		if t.IsZero() {
+			continue
+		}
+		if soonest.IsZero() || t.Before(soonest) {
+			soonest = t
+		}
+	}
+	if soonest.IsZero() {
+		return
+	}
+	delay := soonest.Sub(now) + 30*time.Second
+	if delay < time.Minute {
+		delay = time.Minute
+	}
+	if delay > 6*time.Hour {
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	cmd := exec.Command("/bin/sh", "-c",
+		fmt.Sprintf("sleep %d; exec %s auto", int(delay.Seconds()), shQuote(exe)))
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // survive the hook process being reaped
+	if err := cmd.Start(); err != nil {
+		return
+	}
+	cmd.Process.Release()
+	fmt.Fprintf(os.Stderr, "claude-pool: will recheck accounts around %s\n",
+		now.Add(delay).Format("15:04"))
+}
+
+// usableAt is the moment u's exhausted windows have all reset — zero when the
+// account is not exhausted or a reset time is unknown.
+func usableAt(u pool.Usage) time.Time {
+	var t time.Time
+	for _, w := range []pool.Window{u.FiveHour, u.SevenDay} {
+		if w.Pct < 100 {
+			continue
+		}
+		if w.ResetsAt.IsZero() {
+			return time.Time{}
+		}
+		if w.ResetsAt.After(t) {
+			t = w.ResetsAt
+		}
+	}
+	return t
+}
+
+// useAccount makes a the active credential, reconciling against what the
+// Keychain actually holds rather than trusting the stored Current pointer, and
+// leaves apikey mode (restoring any displaced foreign apiKeyHelper).
+func useAccount(s *pool.Store, a *pool.Account) error {
+	kc, err := pool.ReadKeychain()
+	if err != nil || kc != a.Blob {
+		if err := pool.WriteKeychain(a.Blob); err != nil {
+			return err
+		}
+	}
+	if s.Mode == pool.ModeAPIKey {
+		if err := pool.RestoreAPIKeyHelper(s.SavedHelper); err != nil {
+			return err
+		}
+	}
+	ns, err := pool.LockedUpdate(func(st *pool.Store) error {
+		st.Mode = pool.ModeAccount
+		st.Current = a.ID
+		st.SavedHelper = ""
+		if e := st.Find(a.ID); e != nil {
+			e.Blob = a.Blob
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	s.Mode, s.Current, s.SavedHelper = ns.Mode, ns.Current, ns.SavedHelper
+	return nil
+}
+
+// enterAPIKeyMode flips auth to the registered API keys. The store is saved
+// BEFORE the settings write, so cc can never observe our helper while the
+// on-disk mode still says account (cmdHelper would refuse to serve). The key
+// announced is the one the first helper call will actually serve.
+func enterAPIKeyMode(s *pool.Store) error {
+	next := s.PeekNextKey()
+	if next == nil {
+		return fmt.Errorf("no API keys registered")
+	}
+	prevHelper, err := pool.GetAPIKeyHelper()
+	if err != nil {
+		return err
+	}
+	cmd, err := helperCommand()
+	if err != nil {
+		return err
+	}
+	ns, err := pool.LockedUpdate(func(st *pool.Store) error {
+		st.Mode = pool.ModeAPIKey
+		st.CurrentKey = next.ID
+		if prevHelper != "" && !isOurHelper(prevHelper) {
+			st.SavedHelper = prevHelper // foreign helper: preserve for restore
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	s.Mode, s.CurrentKey, s.SavedHelper = ns.Mode, ns.CurrentKey, ns.SavedHelper
+	if err := pool.SetAPIKeyHelper(cmd); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "claude-pool: switching to API key %q\n", next.ID)
+	warnRunning()
+	return nil
+}
+
+// cmdHelper implements cc's apiKeyHelper contract: print an auth value to
+// stdout. It rotates the round-robin cursor on every call, so cc's periodic
+// helper refresh (TTL/401/startup) spreads load across the registered keys.
+// The whole read-rotate-save runs under the store lock.
+func cmdHelper() error {
+	var key string
+	if _, err := pool.LockedUpdate(func(st *pool.Store) error {
+		if st.Mode != pool.ModeAPIKey {
+			return fmt.Errorf("not in API key mode")
+		}
+		k := st.NextKey()
+		if k == nil {
+			return fmt.Errorf("no API keys registered")
+		}
+		key = k.Key
+		return nil
+	}); err != nil {
+		return err
+	}
+	// Cost guard: cc calls the helper exactly when it is about to spend on an
+	// API key. Probe the accounts; if one has recovered, leave API-key mode
+	// right now — the key printed below bridges only the in-flight request,
+	// and the next helper refresh finds the subscription credential restored.
+	probeRecovery()
+	fmt.Println(key)
+	return nil
+}
+
+// probeRecovery returns to account mode from inside the helper the moment any
+// account has headroom again. Best-effort: any failure just keeps key mode.
+func probeRecovery() {
+	s, err := pool.Load()
+	if err != nil || s.Mode != pool.ModeAPIKey || len(s.Accounts) == 0 {
+		return
+	}
+	usages, errs := pollAccounts(s, nil)
+	best, bestScore, polled := bestAccount(s, usages, errs)
+	if polled == 0 || bestScore >= 100 {
+		return
+	}
+	if err := useAccount(s, best); err != nil {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "claude-pool: account %q recovered (%.0f%% used); leaving API key mode\n",
+		best.ID, bestScore)
+}
+
+func cmdStatusline() error {
+	s, err := pool.Load()
+	if err != nil {
+		return err
+	}
+	if s.Mode == pool.ModeAPIKey {
+		fmt.Printf("key:%s\n", s.CurrentKey)
+		return nil
+	}
+	cur := s.Find(s.Current)
+	if cur == nil {
+		return fmt.Errorf("no active account")
+	}
+	u, err := usageFor(s, cur)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s %s\n", cur.ID, u.FormatStatuslineANSI(time.Now()))
+	return nil
+}
+
+func maskKey(key string) string {
+	if len(key) <= 12 {
+		return "…"
+	}
+	return key[:7] + "…" + key[len(key)-4:]
+}
+
+func warnRunning() {
+	if pids := pool.RunningSessions(); len(pids) > 0 {
+		fmt.Fprintf(os.Stderr,
+			"note: %d Claude Code session(s) running; restart cc to apply the swap instantly "+
+				"(mid-session pickup is not guaranteed)\n", len(pids))
+	}
+}
+
+func execClaude(args []string) error {
+	path, err := exec.LookPath("claude")
+	if err != nil {
+		return fmt.Errorf("claude not found in PATH: %w", err)
+	}
+	argv := append([]string{"claude"}, args...)
+	return syscall.Exec(path, argv, os.Environ())
+}

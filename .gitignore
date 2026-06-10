@@ -2,3 +2,4 @@ bin/
 tmp/
 *.log
 .DS_Store
+.claude/

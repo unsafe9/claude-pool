@@ -1,8 +1,8 @@
 build:
-	go build -o bin/claudeproxy ./cmd/claudeproxy
+	go build -o bin/claude-pool ./cmd/claude-pool
 
 test:
 	go test ./...
 
-run:
-	go run ./cmd/claudeproxy
+install:
+	go install ./cmd/claude-pool
