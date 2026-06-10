@@ -26,6 +26,11 @@ import (
 	"golang.org/x/term"
 )
 
+// version is the build version, injected via -ldflags "-X main.version=vX.Y.Z"
+// by the release workflow. Local/source builds keep "dev", which the
+// session-start hook treats as a developer build and never auto-replaces.
+var version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -47,8 +52,11 @@ func main() {
 		err = cmdAuto(os.Args[2:])
 	case "helper":
 		err = cmdHelper()
-	case "current":
-		err = cmdCurrent()
+	case "status":
+		err = cmdStatus()
+	case "version", "--version", "-v":
+		fmt.Println(version)
+		return
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -86,8 +94,9 @@ Usage:
         --threshold 0.0-1.0 Binding-utilization trigger for --if-needed (default 0.8)
         --launch            Exec `+"`claude`"+` after switching (pass cc args after --)
   claude-pool helper                  apiKeyHelper hook for cc (managed by auto)
-  claude-pool current                 Print the active auth profile ("work", or
-                                      "key:NAME" in API-key mode); no network
+  claude-pool status                  Active auth profile as JSON (no network):
+                                      {mode,name[,resets_at,reset_in_seconds]}
+  claude-pool version                 Print the build version
 
 Add accounts: log into cc with each account, then run `+"`import --id NAME`"+` each time.
 `)
@@ -916,22 +925,57 @@ func cmdHelper() error {
 	return nil
 }
 
-// cmdCurrent prints the active auth profile — the account ID, or "key:NAME"
-// in API-key mode — from the store alone, no network: cheap enough to call
-// from a statusline script on every render.
-func cmdCurrent() error {
+// cmdStatus prints the active auth profile as JSON from the store alone, no
+// network — cheap enough for a statusline script to call on every render. In
+// API-key mode it adds the soonest moment an account is expected to free up
+// (the soonest cached window reset), so a statusline can show "back to
+// subscription in 40m". That reset is read from the usage cache `auto` persists;
+// when no usable reset is known (cold cache) the reset fields are omitted.
+func cmdStatus() error {
 	s, err := pool.Load()
 	if err != nil {
 		return err
 	}
+	out := struct {
+		Mode           string `json:"mode"`
+		Name           string `json:"name"`
+		ResetsAt       string `json:"resets_at,omitempty"`
+		ResetInSeconds *int64 `json:"reset_in_seconds,omitempty"`
+	}{Mode: pool.ModeAccount, Name: s.Current}
+
 	if s.Mode == pool.ModeAPIKey {
-		fmt.Printf("key:%s\n", s.CurrentKey)
-		return nil
+		out.Mode = pool.ModeAPIKey
+		out.Name = s.CurrentKey
+		if t := soonestRecovery(s); !t.IsZero() {
+			secs := int64(time.Until(t).Seconds())
+			if secs < 0 {
+				secs = 0
+			}
+			out.ResetsAt = t.Format(time.RFC3339)
+			out.ResetInSeconds = &secs
+		}
 	}
-	if s.Current != "" {
-		fmt.Println(s.Current)
+	return json.NewEncoder(os.Stdout).Encode(out)
+}
+
+// soonestRecovery is the earliest moment any account is expected to leave
+// exhaustion, from each account's cached usage — i.e. roughly when API-key mode
+// can end. Zero when no account has a known usable-at time.
+func soonestRecovery(s *pool.Store) time.Time {
+	var soonest time.Time
+	for _, a := range s.Accounts {
+		if a.Usage == nil {
+			continue
+		}
+		t := usableAt(*a.Usage)
+		if t.IsZero() {
+			continue
+		}
+		if soonest.IsZero() || t.Before(soonest) {
+			soonest = t
+		}
 	}
-	return nil
+	return soonest
 }
 
 func maskKey(key string) string {

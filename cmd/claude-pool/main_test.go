@@ -41,6 +41,31 @@ func TestUsableAt(t *testing.T) {
 	}
 }
 
+func TestSoonestRecovery(t *testing.T) {
+	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
+	in1h, in3h := now.Add(time.Hour), now.Add(3*time.Hour)
+
+	// Two exhausted accounts → the earlier reset wins; an account with no
+	// cached usage is skipped, not treated as usable now.
+	s := &pool.Store{Accounts: []*pool.Account{
+		{ID: "a", Usage: &pool.Usage{FiveHour: pool.Window{Pct: 100, ResetsAt: in3h}}},
+		{ID: "b"},
+		{ID: "c", Usage: &pool.Usage{FiveHour: pool.Window{Pct: 100, ResetsAt: in1h}}},
+	}}
+	if got := soonestRecovery(s); !got.Equal(in1h) {
+		t.Errorf("soonestRecovery = %v, want %v", got, in1h)
+	}
+
+	// No account has a known usable-at time → zero (reset fields omitted).
+	s = &pool.Store{Accounts: []*pool.Account{
+		{ID: "a", Usage: &pool.Usage{FiveHour: pool.Window{Pct: 80, ResetsAt: in1h}}},
+		{ID: "b"},
+	}}
+	if got := soonestRecovery(s); !got.IsZero() {
+		t.Errorf("soonestRecovery with no exhausted account = %v, want zero", got)
+	}
+}
+
 func TestShQuote(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"/Users/x/go/bin/claude-pool", "'/Users/x/go/bin/claude-pool'"},

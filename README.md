@@ -15,7 +15,7 @@ claude-pool ships as a Claude Code plugin — installing it is all the setup the
 
 On the next session start the plugin takes care of the rest:
 
-- bootstraps the `claude-pool` binary in the background with `go install` (requires a Go toolchain; the binary lands in `$GOBIN`, default `~/go/bin`);
+- downloads the prebuilt `claude-pool` binary (Apple Silicon) for the plugin's version from GitHub Releases into `$GOBIN` (default `~/go/bin`), in the background — and re-downloads it whenever a plugin update outpaces the local binary (locally built `dev` binaries are left alone);
 - imports the account you are currently logged into as the pool's first account;
 - from then on, hooks keep the pool balanced and swap credentials — no manual commands needed.
 
@@ -77,11 +77,16 @@ The hooks drive everything through `claude-pool auto`; the same binary doubles a
 claude-pool list           # accounts with live 5h/7d usage, then keys
 claude-pool switch work    # switch to a specific account
 claude-pool rm console1    # remove an account or API key
-claude-pool current        # active auth profile: "work", or "key:console1" in API-key mode
+claude-pool status         # active auth profile as JSON (no network)
 claude-pool helper         # apiKeyHelper hook for cc (managed by auto, not for manual use)
+claude-pool version        # build version
 ```
 
-`current` is network-free, so a custom statusline script can call it on every render to show which auth profile is active — usage and reset times for the current credential are already exposed to statusline scripts by Claude Code itself (`.rate_limits`).
+`status` is network-free, so a custom statusline script can call it on every render. It prints `{"mode","name"}` — `mode` is `account` or `apikey`, `name` is the active account or key id — and in API-key mode adds `"resets_at"` and `"reset_in_seconds"`: how long until an account is expected to free up and subscription auth resumes (read from the usage cache, omitted when unknown). Parse it with `jq`:
+
+```bash
+claude-pool status | jq -r '.mode'   # account | apikey
+```
 
 Manual swapping, for use outside the hooks:
 
