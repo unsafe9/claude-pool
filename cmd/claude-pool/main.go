@@ -123,11 +123,17 @@ func ensureFresh(s *pool.Store, a *pool.Account) (pool.OAuthData, error) {
 		if e := st.Find(a.ID); e != nil {
 			e.Blob = nb
 		}
-		// Blob persist + Keychain write are one locked unit so a concurrent
-		// auto/helper cannot leave the store and Keychain pointing at
-		// different credentials for the live account.
-		if s.Mode != pool.ModeAPIKey && a.ID == s.Current {
-			return pool.WriteKeychain(nb)
+		// Persist the rotated blob and update the Keychain under the same lock
+		// so a concurrent auto/helper can't desync them. Guard on the freshly
+		// loaded st.Current (not the stale snapshot) so we don't clobber a swap
+		// another process just made. The Keychain write is best-effort: the
+		// rotated refresh token MUST still be saved even if it fails, or the
+		// next refresh would reuse a token the server may already have rotated
+		// out — a deferred Keychain write is reconciled by the next auto/harvest.
+		if st.Mode != pool.ModeAPIKey && a.ID == st.Current {
+			if werr := pool.WriteKeychain(nb); werr != nil {
+				fmt.Fprintln(os.Stderr, "claude-pool: keychain update deferred:", werr)
+			}
 		}
 		return nil
 	}); err != nil {
@@ -471,17 +477,17 @@ func cmdList(args []string) error {
 		return nil
 	}
 	now := time.Now()
-	for _, a := range s.Accounts {
+	usages, errs := pollAccounts(s, nil)
+	for i, a := range s.Accounts {
 		marker := "  "
 		if a.ID == s.Current && s.Mode != pool.ModeAPIKey {
 			marker = "* "
 		}
-		u, err := usageFor(s, a)
-		if err != nil {
-			fmt.Printf("%s%-16s  (error: %v)\n", marker, a.ID, err)
+		if errs[i] != nil {
+			fmt.Printf("%s%-16s  (error: %v)\n", marker, a.ID, errs[i])
 			continue
 		}
-		fmt.Printf("%s%-16s  %s\n", marker, a.ID, u.FormatStatusline(now))
+		fmt.Printf("%s%-16s  %s\n", marker, a.ID, usages[i].FormatStatusline(now))
 	}
 	for _, k := range s.APIKeys {
 		marker := "  "
