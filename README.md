@@ -4,6 +4,51 @@ Credential pooler for [Claude Code](https://github.com/anthropics/claude-code) o
 
 No proxy, no man-in-the-middle: Claude Code talks to `api.anthropic.com` directly. claude-pool only manages which credential it holds.
 
+## Quick start
+
+claude-pool ships as a Claude Code plugin — installing it is all the setup there is. In Claude Code:
+
+```
+/plugin marketplace add unsafe9/claude-pool
+/plugin install claude-pool@claude-pool
+```
+
+On the next session start the plugin takes care of the rest:
+
+- bootstraps the `claude-pool` binary in the background with `go install` (requires a Go toolchain; the binary lands in `$GOBIN`, default `~/go/bin`);
+- imports the account you are currently logged into as the pool's first account;
+- from then on, hooks keep the pool balanced and swap credentials — no manual commands needed.
+
+Three hooks do the work:
+
+- **StopFailure / rate_limit** — reactive: the turn just died on a rate limit; swap immediately so the next attempt uses a fresh credential.
+- **SessionStart** — proactive: start each session on the account with the most headroom.
+- **UserPromptSubmit** — proactive, fire-and-forget: keeps the pool balanced mid-session without delaying the prompt.
+
+`auto` is a silent no-op while the pool is empty, so the install order never matters.
+
+### Pool more accounts
+
+One account is not much of a pool. `/login` with each additional account, then import it:
+
+```bash
+claude-pool import                 # auto-named after the account email (or a timestamp)
+# /login with the next account, then:
+claude-pool import --id work       # or name it yourself
+```
+
+If `claude-pool` is not on your `PATH`, it is at `~/go/bin/claude-pool`.
+
+Importing also makes that account the active one. Re-importing the same account (same `--id`, or auto-named by the same email) refreshes the stored credential without creating a duplicate.
+
+### Register fallback API keys (optional)
+
+```bash
+claude-pool key add                            # auto-named key-YYYYMMDD-HHMMSS, key via stdin
+claude-pool key add --id console2              # paste at the prompt (input hidden)
+# or non-interactively:  pbpaste | claude-pool key add --id console2
+```
+
 ## How it works
 
 - **Account mode** (the default, preferred state): the chosen account's OAuth credential is written into the macOS Keychain item Claude Code reads (`Claude Code-credentials`). Expiring tokens are refreshed before use.
@@ -24,7 +69,34 @@ account mode ◀──(any account resets)───── API-key mode
 
 State lives in `~/.config/claude-pool/pool.json` (mode 0600), flock-protected against concurrent hook/helper runs.
 
-## Installation
+## CLI
+
+The hooks drive everything through `claude-pool auto`; the same binary doubles as a CLI for inspecting and steering the pool by hand.
+
+```bash
+claude-pool list           # accounts with live 5h/7d usage, then keys
+claude-pool switch work    # switch to a specific account
+claude-pool rm console1    # remove an account or API key
+claude-pool current        # active auth profile: "work", or "key:console1" in API-key mode
+claude-pool helper         # apiKeyHelper hook for cc (managed by auto, not for manual use)
+```
+
+`current` is network-free, so a custom statusline script can call it on every render to show which auth profile is active — usage and reset times for the current credential are already exposed to statusline scripts by Claude Code itself (`.rate_limits`).
+
+Manual swapping, for use outside the hooks:
+
+```bash
+claude-pool auto                               # pick the least-used account / fall back / recover
+claude-pool auto --if-needed --threshold 0.9   # cheap path: poll only the current account,
+                                               # act only if it is past 90% (default 0.8)
+claude-pool auto --launch -- --continue        # switch, then exec `claude --continue`
+```
+
+`--launch` always execs `claude` afterwards, even if the pool step failed — a pool error never blocks Claude Code from starting on whatever credential it already holds.
+
+### Installing the binary without the plugin
+
+The plugin bootstraps the binary automatically; install it by hand only to use the CLI standalone:
 
 ```bash
 go install github.com/unsafe9/claude-pool/cmd/claude-pool@latest
@@ -37,70 +109,6 @@ git clone https://github.com/unsafe9/claude-pool.git
 cd claude-pool
 make install   # = go install ./cmd/claude-pool
 ```
-
-`go install` places the binary in `$GOBIN` (default `~/go/bin`). Installing the binary by hand is optional — the plugin below bootstraps it automatically on first session start.
-
-## Usage
-
-### Add accounts
-
-Log into Claude Code with each account, importing after each login:
-
-```bash
-claude-pool import                 # auto-named after the account email (or a timestamp)
-# /login with the next account, then:
-claude-pool import --id work       # or name it yourself
-```
-
-Importing also makes that account the active one. Re-importing the same account (same `--id`, or auto-named by the same email) refreshes the stored credential without creating a duplicate.
-
-### Register fallback API keys (optional)
-
-```bash
-claude-pool key add                            # auto-named key-YYYYMMDD-HHMMSS, key via stdin
-claude-pool key add --id console2              # paste at the prompt (input hidden)
-# or non-interactively:  pbpaste | claude-pool key add --id console2
-```
-
-### Automatic switching
-
-```bash
-claude-pool auto                               # pick the least-used account / fall back / recover
-claude-pool auto --if-needed --threshold 0.9   # cheap path: poll only the current account,
-                                               # act only if it is past 90% (default 0.8)
-claude-pool auto --launch -- --continue        # switch, then exec `claude --continue`
-```
-
-`--launch` always execs `claude` afterwards, even if the pool step failed — a pool error never blocks Claude Code from starting on whatever credential it already holds.
-
-### Other commands
-
-```bash
-claude-pool list           # accounts with live 5h/7d usage, then keys
-claude-pool switch work    # switch to a specific account
-claude-pool rm console1    # remove an account or API key
-claude-pool current        # active auth profile: "work", or "key:console1" in API-key mode
-claude-pool helper         # apiKeyHelper hook for cc (managed by auto, not for manual use)
-```
-
-`current` is network-free, so a custom statusline script can call it on every render to show which auth profile is active — usage and reset times for the current credential are already exposed to statusline scripts by Claude Code itself (`.rate_limits`).
-
-## Hook-driven swapping
-
-This repo doubles as a Claude Code plugin that ships the swap hooks preconfigured. In Claude Code:
-
-```
-/plugin marketplace add unsafe9/claude-pool
-/plugin install claude-pool@claude-pool
-```
-
-On the first session start the plugin bootstraps the binary with `go install` automatically (requires a Go toolchain); everything else works out of the box. The plugin wires three hooks:
-
-- **StopFailure / rate_limit** — reactive: the turn just died on a rate limit; swap immediately so the next attempt uses a fresh credential.
-- **SessionStart** — proactive: start each session on the account with the most headroom. When the pool has no accounts yet, the logged-in account is imported automatically first (the hook checks `list --json` and calls `import`).
-- **UserPromptSubmit** — proactive, fire-and-forget: keeps the pool balanced mid-session without delaying the prompt.
-
-`auto` is a silent no-op while the pool is empty, so the plugin is safe to install before importing any accounts.
 
 ## Caveats
 
