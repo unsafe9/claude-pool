@@ -123,20 +123,21 @@ func ensureFresh(s *pool.Store, a *pool.Account) (pool.OAuthData, error) {
 		if e := st.Find(a.ID); e != nil {
 			e.Blob = nb
 		}
+		// Blob persist + Keychain write are one locked unit so a concurrent
+		// auto/helper cannot leave the store and Keychain pointing at
+		// different credentials for the live account.
+		if s.Mode != pool.ModeAPIKey && a.ID == s.Current {
+			return pool.WriteKeychain(nb)
+		}
 		return nil
 	}); err != nil {
 		return od, err
-	}
-	if s.Mode != pool.ModeAPIKey && a.ID == s.Current {
-		if err := pool.WriteKeychain(nb); err != nil {
-			return od, err
-		}
 	}
 	od, _ = pool.ParseBlob(nb)
 	return od, nil
 }
 
-// usageFor is the one token→usage chain shared by list, statusline, and auto.
+// usageFor is the one token→usage chain shared by list and auto.
 func usageFor(s *pool.Store, a *pool.Account) (pool.Usage, error) {
 	od, err := ensureFresh(s, a)
 	if err != nil {
@@ -699,19 +700,45 @@ func scheduleRecoveryWake(usages []pool.Usage, errs []error) {
 	if delay > 6*time.Hour {
 		return
 	}
+	target := now.Add(delay)
+	// Dedup: repeated apikey entries would otherwise pile up overlapping wakers
+	// that all fire together. Skip if one is already pending at-or-before us.
+	if pool.PendingWakeBefore(target) {
+		return
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return
 	}
-	cmd := exec.Command("/bin/sh", "-c",
-		fmt.Sprintf("sleep %d; exec %s auto", int(delay.Seconds()), shQuote(exe)))
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // survive the hook process being reaped
-	if err := cmd.Start(); err != nil {
+	if err := startDetached(exec.Command("/bin/sh", "-c",
+		fmt.Sprintf("sleep %d; exec %s auto", int(delay.Seconds()), shQuote(exe)))); err != nil {
 		return
 	}
-	cmd.Process.Release()
+	pool.RecordWake(target)
 	fmt.Fprintf(os.Stderr, "claude-pool: will recheck accounts around %s\n",
-		now.Add(delay).Format("15:04"))
+		target.Format("15:04"))
+}
+
+// spawnDetached re-execs this binary with args in a new session, fully detached
+// so it outlives the hook process that is about to be reaped. Best-effort: the
+// caller ignores the error on a hot path.
+func spawnDetached(args ...string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	return startDetached(exec.Command(exe, args...))
+}
+
+// startDetached launches cmd in a new session (Setsid) and releases it, so it
+// survives the parent hook process being reaped. Stdout/Stderr are left nil
+// (→ /dev/null). The shared boilerplate for spawnDetached and the recovery waker.
+func startDetached(cmd *exec.Cmd) error {
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	return cmd.Process.Release()
 }
 
 // usableAt is the moment u's exhausted windows have all reset — zero when the
@@ -736,12 +763,7 @@ func usableAt(u pool.Usage) time.Time {
 // Keychain actually holds rather than trusting the stored Current pointer, and
 // leaves apikey mode (restoring any displaced foreign apiKeyHelper).
 func useAccount(s *pool.Store, a *pool.Account) error {
-	kc, err := pool.ReadKeychain()
-	if err != nil || kc != a.Blob {
-		if err := pool.WriteKeychain(a.Blob); err != nil {
-			return err
-		}
-	}
+	kc, kcErr := pool.ReadKeychain()
 	if s.Mode == pool.ModeAPIKey {
 		if err := pool.RestoreAPIKeyHelper(s.SavedHelper); err != nil {
 			return err
@@ -753,6 +775,11 @@ func useAccount(s *pool.Store, a *pool.Account) error {
 		st.SavedHelper = ""
 		if e := st.Find(a.ID); e != nil {
 			e.Blob = a.Blob
+		}
+		// Keychain write + store update are one locked unit so a concurrent
+		// auto/helper cannot desync the active credential from Current.
+		if kcErr != nil || kc != a.Blob {
+			return pool.WriteKeychain(a.Blob)
 		}
 		return nil
 	})
@@ -793,6 +820,18 @@ func enterAPIKeyMode(s *pool.Store) error {
 	}
 	s.Mode, s.CurrentKey, s.SavedHelper = ns.Mode, ns.CurrentKey, ns.SavedHelper
 	if err := pool.SetAPIKeyHelper(cmd); err != nil {
+		// The store now says apikey but no helper is installed; cc would
+		// silently fall back to the exhausted Keychain account while `current`
+		// reports key mode. Roll the store back to account mode before returning.
+		rb, rbErr := pool.LockedUpdate(func(st *pool.Store) error {
+			st.Mode = pool.ModeAccount
+			st.CurrentKey = ""
+			st.SavedHelper = ""
+			return nil
+		})
+		if rbErr == nil {
+			s.Mode, s.CurrentKey, s.SavedHelper = rb.Mode, rb.CurrentKey, rb.SavedHelper
+		}
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "claude-pool: switching to API key %q\n", next.ID)
@@ -819,32 +858,16 @@ func cmdHelper() error {
 	}); err != nil {
 		return err
 	}
-	// Cost guard: cc calls the helper exactly when it is about to spend on an
-	// API key. Probe the accounts; if one has recovered, leave API-key mode
-	// right now — the key printed below bridges only the in-flight request,
-	// and the next helper refresh finds the subscription credential restored.
-	probeRecovery()
+	// Serve the key first: cc waits for THIS process to exit, so any recovery
+	// work must not block here (a full poll can take ~16s and exceed cc's
+	// helper timeout). stdout is unbuffered, so this flushes to cc now.
 	fmt.Println(key)
+	// Cost guard: cc calls the helper exactly when it is about to spend on an
+	// API key. Hand the recovery decision to a detached `auto`, which already
+	// leaves apikey mode the moment an account has headroom — without blocking
+	// cc on the network.
+	_ = spawnDetached("auto")
 	return nil
-}
-
-// probeRecovery returns to account mode from inside the helper the moment any
-// account has headroom again. Best-effort: any failure just keeps key mode.
-func probeRecovery() {
-	s, err := pool.Load()
-	if err != nil || s.Mode != pool.ModeAPIKey || len(s.Accounts) == 0 {
-		return
-	}
-	usages, errs := pollAccounts(s, nil)
-	best, bestScore, polled := bestAccount(s, usages, errs)
-	if polled == 0 || bestScore >= 100 {
-		return
-	}
-	if err := useAccount(s, best); err != nil {
-		return
-	}
-	fmt.Fprintf(os.Stderr, "claude-pool: account %q recovered (%.0f%% used); leaving API key mode\n",
-		best.ID, bestScore)
 }
 
 // cmdCurrent prints the active auth profile — the account ID, or "key:NAME"
