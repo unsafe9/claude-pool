@@ -203,18 +203,13 @@ func reconcile(s *pool.Store) error {
 
 // demote drops the store back to account mode and clears the saved helper.
 func demote(s *pool.Store) error {
-	ns, err := pool.LockedUpdate(func(st *pool.Store) error {
+	return s.Update(func(st *pool.Store) error {
 		if st.Mode == pool.ModeAPIKey {
 			st.Mode = pool.ModeAccount
 		}
 		st.SavedHelper = ""
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-	s.Mode, s.SavedHelper = ns.Mode, ns.SavedHelper
-	return nil
 }
 
 // harvest folds a Keychain credential that cc itself refreshed (or a manual
@@ -227,7 +222,7 @@ func harvest(s *pool.Store) {
 		return
 	}
 	adopt := func(a *pool.Account) {
-		ns, err := pool.LockedUpdate(func(st *pool.Store) error {
+		_ = s.Update(func(st *pool.Store) error {
 			if e := st.Find(a.ID); e != nil {
 				e.Blob = kc
 			}
@@ -236,11 +231,6 @@ func harvest(s *pool.Store) {
 			}
 			return nil
 		})
-		if err != nil {
-			return
-		}
-		a.Blob = kc
-		s.Current = ns.Current
 	}
 	for _, a := range s.Accounts {
 		if a.Blob == kc {
@@ -775,7 +765,7 @@ func useAccount(s *pool.Store, a *pool.Account) error {
 			return err
 		}
 	}
-	ns, err := pool.LockedUpdate(func(st *pool.Store) error {
+	return s.Update(func(st *pool.Store) error {
 		st.Mode = pool.ModeAccount
 		st.Current = a.ID
 		st.SavedHelper = ""
@@ -789,11 +779,6 @@ func useAccount(s *pool.Store, a *pool.Account) error {
 		}
 		return nil
 	})
-	if err != nil {
-		return err
-	}
-	s.Mode, s.Current, s.SavedHelper = ns.Mode, ns.Current, ns.SavedHelper
-	return nil
 }
 
 // enterAPIKeyMode flips auth to the registered API keys. The store is saved
@@ -813,31 +798,26 @@ func enterAPIKeyMode(s *pool.Store) error {
 	if err != nil {
 		return err
 	}
-	ns, err := pool.LockedUpdate(func(st *pool.Store) error {
+	if err := s.Update(func(st *pool.Store) error {
 		st.Mode = pool.ModeAPIKey
 		st.CurrentKey = next.ID
 		if prevHelper != "" && !isOurHelper(prevHelper) {
 			st.SavedHelper = prevHelper // foreign helper: preserve for restore
 		}
 		return nil
-	})
-	if err != nil {
+	}); err != nil {
 		return err
 	}
-	s.Mode, s.CurrentKey, s.SavedHelper = ns.Mode, ns.CurrentKey, ns.SavedHelper
 	if err := pool.SetAPIKeyHelper(cmd); err != nil {
 		// The store now says apikey but no helper is installed; cc would
 		// silently fall back to the exhausted Keychain account while `current`
 		// reports key mode. Roll the store back to account mode before returning.
-		rb, rbErr := pool.LockedUpdate(func(st *pool.Store) error {
+		_ = s.Update(func(st *pool.Store) error {
 			st.Mode = pool.ModeAccount
 			st.CurrentKey = ""
 			st.SavedHelper = ""
 			return nil
 		})
-		if rbErr == nil {
-			s.Mode, s.CurrentKey, s.SavedHelper = rb.Mode, rb.CurrentKey, rb.SavedHelper
-		}
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "claude-pool: switching to API key %q\n", next.ID)

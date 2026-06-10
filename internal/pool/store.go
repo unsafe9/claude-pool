@@ -218,3 +218,17 @@ func LockedUpdate(fn func(*Store) error) (*Store, error) {
 	}
 	return s, nil
 }
+
+// Update runs fn under the store lock (load-modify-save, atomic across processes
+// via flock) and writes the resulting state back into s, so callers never hand-copy
+// individual fields. NOTE: this REPLACES s's contents (including the Accounts/APIKeys
+// slices) with the freshly-loaded post-save state, so any *Account pointer obtained
+// from s before the call is detached afterward — do not reuse such pointers after Update.
+func (s *Store) Update(fn func(*Store) error) error {
+	ns, err := LockedUpdate(fn)
+	if err != nil {
+		return err
+	}
+	*s = *ns
+	return nil
+}
