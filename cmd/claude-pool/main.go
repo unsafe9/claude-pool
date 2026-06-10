@@ -378,7 +378,11 @@ func cmdRemove(args []string) error {
 	}
 	leftAPIKeyMode := false
 	var saved string
+	wasActiveAccount := false
 	if _, err := pool.LockedUpdate(func(st *pool.Store) error {
+		// Record whether we are about to remove the live Keychain account before
+		// Remove clears st.Current.
+		wasActiveAccount = st.Mode != pool.ModeAPIKey && st.Current == args[0]
 		if !st.Remove(args[0]) {
 			return fmt.Errorf("no account or API key %q (see `claude-pool list`)", args[0])
 		}
@@ -398,6 +402,22 @@ func cmdRemove(args []string) error {
 			return err
 		}
 		fmt.Fprintln(os.Stderr, "claude-pool: left API key mode (last key removed); cc will use the Keychain account")
+	}
+	if wasActiveAccount {
+		// The removed account still owns the live Keychain blob. Switch to a
+		// remaining account so cc stops authenticating as the removed one. If
+		// none remain, there is nothing to switch to.
+		s, err := pool.Load()
+		if err != nil {
+			return err
+		}
+		if len(s.Accounts) > 0 {
+			a := s.Accounts[0]
+			if err := useAccount(s, a); err != nil {
+				return err
+			}
+			fmt.Fprintf(os.Stderr, "claude-pool: removed the active account; switched to %q\n", a.ID)
+		}
 	}
 	fmt.Printf("removed %q\n", args[0])
 	return nil

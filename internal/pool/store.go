@@ -185,7 +185,7 @@ func (s *Store) PeekNextKey() *APIKey {
 
 // LockedUpdate loads the store under an exclusive flock, applies fn, and saves
 // the result, making the read-modify-write atomic across the processes that
-// race through cc hooks (auto, helper, statusline). An error from fn aborts
+// race through cc hooks (auto, helper, current). An error from fn aborts
 // without saving. The updated store is returned so callers can sync in-memory
 // state.
 func LockedUpdate(fn func(*Store) error) (*Store, error) {
