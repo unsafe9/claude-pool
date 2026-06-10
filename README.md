@@ -58,7 +58,8 @@ Importing also makes that account the active one. Re-importing the same account 
 
 ```bash
 claude-pool key add                            # auto-named key-YYYYMMDD-HHMMSS, key via stdin
-claude-pool key add --id console2 sk-ant-...
+claude-pool key add --id console2              # paste at the prompt (input hidden)
+# or non-interactively:  pbpaste | claude-pool key add --id console2
 ```
 
 ### Automatic switching

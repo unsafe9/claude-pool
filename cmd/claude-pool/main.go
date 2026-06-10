@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/unsafe9/claude-pool/internal/pool"
+	"golang.org/x/term"
 )
 
 func main() {
@@ -341,11 +342,20 @@ func cmdKey(args []string) error {
 	key := strings.TrimSpace(fs.Arg(0))
 	if key == "" {
 		fmt.Fprint(os.Stderr, "paste API key: ")
-		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
-		if err != nil && line == "" {
-			return fmt.Errorf("read key: %w", err)
+		if term.IsTerminal(int(os.Stdin.Fd())) {
+			b, err := term.ReadPassword(int(os.Stdin.Fd()))
+			fmt.Fprintln(os.Stderr) // ReadPassword swallows the user's Enter
+			if err != nil && len(b) == 0 {
+				return fmt.Errorf("read key: %w", err)
+			}
+			key = strings.TrimSpace(string(b))
+		} else {
+			line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+			if err != nil && line == "" {
+				return fmt.Errorf("read key: %w", err)
+			}
+			key = strings.TrimSpace(line)
 		}
-		key = strings.TrimSpace(line)
 	}
 	if key == "" {
 		return fmt.Errorf("empty API key")
