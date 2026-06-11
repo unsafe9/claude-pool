@@ -19,7 +19,6 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/unsafe9/claude-pool/internal/pool"
@@ -140,7 +139,7 @@ func ensureFresh(s *pool.Store, a *pool.Account) (pool.OAuthData, error) {
 		// next refresh would reuse a token the server may already have rotated
 		// out — a deferred Keychain write is reconciled by the next auto/harvest.
 		if st.Mode != pool.ModeAPIKey && a.ID == st.Current {
-			if werr := pool.WriteKeychain(nb); werr != nil {
+			if werr := pool.WriteCredential(nb); werr != nil {
 				fmt.Fprintln(os.Stderr, "claude-pool: keychain update deferred:", werr)
 			}
 		}
@@ -159,20 +158,6 @@ func usageFor(s *pool.Store, a *pool.Account) (pool.Usage, error) {
 		return pool.Usage{}, err
 	}
 	return pool.FetchUsage(od.AccessToken)
-}
-
-// helperCommand returns the apiKeyHelper command line for this binary. cc runs
-// the value with /bin/sh, so the path must be shell-quoted.
-func helperCommand() (string, error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return "", err
-	}
-	return shQuote(exe) + " helper", nil
-}
-
-func shQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // isOurHelper reports whether an apiKeyHelper value is one we installed —
@@ -226,7 +211,7 @@ func demote(s *pool.Store) error {
 // overwrites it with a stale stored blob. Attribution is by account email via
 // the profile API; an unattributable credential is left untouched.
 func harvest(s *pool.Store) {
-	kc, err := pool.ReadKeychain()
+	kc, err := pool.ReadCredential()
 	if err != nil || kc == "" {
 		return
 	}
@@ -272,7 +257,7 @@ func cmdImport(args []string) error {
 		return err
 	}
 
-	blob, err := pool.ReadKeychain()
+	blob, err := pool.ReadCredential()
 	if err != nil {
 		return err
 	}
@@ -738,7 +723,7 @@ func scheduleRecoveryWake(usages []pool.Usage, errs []error) {
 	if err != nil {
 		return
 	}
-	if err := startDetached(exec.Command("/bin/sh", "-c",
+	if err := pool.StartDetached(exec.Command("/bin/sh", "-c",
 		fmt.Sprintf("sleep %d; exec %s auto", int(delay.Seconds()), shQuote(exe)))); err != nil {
 		return
 	}
@@ -755,18 +740,7 @@ func spawnDetached(args ...string) error {
 	if err != nil {
 		return err
 	}
-	return startDetached(exec.Command(exe, args...))
-}
-
-// startDetached launches cmd in a new session (Setsid) and releases it, so it
-// survives the parent hook process being reaped. Stdout/Stderr are left nil
-// (→ /dev/null). The shared boilerplate for spawnDetached and the recovery waker.
-func startDetached(cmd *exec.Cmd) error {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	return cmd.Process.Release()
+	return pool.StartDetached(exec.Command(exe, args...))
 }
 
 // stillExhausted reports whether a's cached usage PROVES it is still exhausted
@@ -828,7 +802,7 @@ func usableAt(u pool.Usage) time.Time {
 // Keychain actually holds rather than trusting the stored Current pointer, and
 // leaves apikey mode (restoring any displaced foreign apiKeyHelper).
 func useAccount(s *pool.Store, a *pool.Account) error {
-	kc, kcErr := pool.ReadKeychain()
+	kc, kcErr := pool.ReadCredential()
 	if s.Mode == pool.ModeAPIKey {
 		if err := pool.RestoreAPIKeyHelper(s.SavedHelper); err != nil {
 			return err
@@ -844,7 +818,7 @@ func useAccount(s *pool.Store, a *pool.Account) error {
 		// Keychain write + store update are one locked unit so a concurrent
 		// auto/helper cannot desync the active credential from Current.
 		if kcErr != nil || kc != a.Blob {
-			return pool.WriteKeychain(a.Blob)
+			return pool.WriteCredential(a.Blob)
 		}
 		return nil
 	})
@@ -993,11 +967,3 @@ func warnRunning() {
 	}
 }
 
-func execClaude(args []string) error {
-	path, err := exec.LookPath("claude")
-	if err != nil {
-		return fmt.Errorf("claude not found in PATH: %w", err)
-	}
-	argv := append([]string{"claude"}, args...)
-	return syscall.Exec(path, argv, os.Environ())
-}
