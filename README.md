@@ -13,20 +13,9 @@ claude-pool ships as a Claude Code plugin — installing it is all the setup the
 /plugin install claude-pool@claude-pool
 ```
 
-Then install the binary once — it goes to `~/.local/bin`, which is normally already on your `PATH` (Claude Code lives there too):
-
-```sh
-# macOS / Linux / WSL
-curl -fsSL https://raw.githubusercontent.com/unsafe9/claude-pool/main/install.sh | sh
-```
-```powershell
-# Windows (PowerShell)
-irm https://raw.githubusercontent.com/unsafe9/claude-pool/main/install.ps1 | iex
-```
-
 From the next session start the plugin takes care of the rest:
 
-- keeps the binary in step with the plugin's version by self-updating in the background whenever a plugin update outpaces it (locally built `dev` binaries are left alone);
+- installs the `claude-pool` binary into `~/.local/bin` on first run (in the background, active the session after), and keeps it in step with the plugin's version by self-updating whenever a plugin update outpaces it (locally built `dev` binaries are left alone);
 - imports the account you are currently logged into as the pool's first account;
 - from then on, hooks keep the pool balanced and swap credentials — no manual commands needed.
 
@@ -37,6 +26,17 @@ Three hooks do the work:
 - **UserPromptSubmit** — proactive, fire-and-forget: keeps the pool balanced mid-session without delaying the prompt.
 
 `auto` is a silent no-op while the pool is empty, so the install order never matters.
+
+To install the binary immediately instead of waiting a session (or to use the CLI without the plugin), run the installer one-liner — it targets `~/.local/bin`, which is normally already on your `PATH` (Claude Code lives there too):
+
+```sh
+# macOS / Linux / WSL
+curl -fsSL https://raw.githubusercontent.com/unsafe9/claude-pool/main/install.sh | sh
+```
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/unsafe9/claude-pool/main/install.ps1 | iex
+```
 
 ### Pool more accounts
 

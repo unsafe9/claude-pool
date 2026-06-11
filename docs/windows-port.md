@@ -149,6 +149,10 @@ cmd/claude-pool/
 - OS별 인스톨러 원라이너: posix `curl -fsSL .../install.sh | sh`, PowerShell
   `irm .../install.ps1 | iex`. `~/.local/bin`에 OS/arch 자산 설치 + PATH 보장 안내.
 - 이후 버전 갱신은 self-update가 담당.
+- **(후속 변경, v0.2.1)** 최초 설치도 자동화: SessionStart에 부트스트랩 훅 2개 추가
+  (exec form `sh` → unix 전용 / `powershell.exe` → Windows 전용; 없는 OS에서는
+  "명령 미존재 → 조용한 실패"로 자기선택). 각 훅은 바이너리 부재 시 동봉 인스톨러를
+  백그라운드 실행(다음 세션 활성). 원라이너는 즉시/수동 설치용으로 유지.
 
 > 대안 B1(plugin `bin/` 동봉): `${CLAUDE_PLUGIN_ROOT}/bin/claude-pool`(확장자 없이)도
 > 실측상 Windows에서 .exe resolve되어 단일 command 가능. 완전 자동(최초도)이나 멀티-OS
