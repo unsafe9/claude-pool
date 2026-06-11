@@ -67,10 +67,10 @@ func TestSoonestRecovery(t *testing.T) {
 }
 
 func TestIsOurHelper(t *testing.T) {
-	if !isOurHelper("'/Users/x/go/bin/claude-pool' helper") {
+	if !isOurHelper("'/Users/x/.local/bin/claude-pool' helper") {
 		t.Error("quoted claude-pool helper should match")
 	}
-	if !isOurHelper("/Users/x/go/bin/claude-pool helper") {
+	if !isOurHelper("/Users/x/.local/bin/claude-pool helper") {
 		t.Error("unquoted claude-pool helper should match")
 	}
 	if isOurHelper("/corp/auth.sh") {

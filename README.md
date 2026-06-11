@@ -123,15 +123,9 @@ claude-pool auto --launch -- --continue        # switch, then exec `claude --con
 The install scripts above fetch a prebuilt binary; build from source if you prefer:
 
 ```bash
-go install github.com/unsafe9/claude-pool/cmd/claude-pool@latest
-```
-
-Or from a clone:
-
-```bash
 git clone https://github.com/unsafe9/claude-pool.git
 cd claude-pool
-make install   # = go install ./cmd/claude-pool
+make install   # builds into ~/.local/bin/claude-pool
 ```
 
 Source builds report version `dev` and are never replaced by the plugin's self-update.

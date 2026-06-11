@@ -6,7 +6,7 @@ import "testing"
 
 func TestShQuote(t *testing.T) {
 	cases := []struct{ in, want string }{
-		{"/Users/x/go/bin/claude-pool", "'/Users/x/go/bin/claude-pool'"},
+		{"/Users/x/.local/bin/claude-pool", "'/Users/x/.local/bin/claude-pool'"},
 		{"/Users/J Doe/bin/claude-pool", "'/Users/J Doe/bin/claude-pool'"},
 		{"/odd/it's/claude-pool", `'/odd/it'\''s/claude-pool'`},
 	}
