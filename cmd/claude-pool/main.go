@@ -148,7 +148,7 @@ func ensureFresh(s *pool.Store, a *pool.Account) (pool.OAuthData, error) {
 		// out — a deferred Keychain write is reconciled by the next auto/harvest.
 		if st.Mode != pool.ModeAPIKey && a.ID == st.Current {
 			if werr := pool.WriteCredential(nb); werr != nil {
-				fmt.Fprintln(os.Stderr, "claude-pool: keychain update deferred:", werr)
+				fmt.Fprintln(os.Stderr, "claude-pool: credential store update deferred:", werr)
 			}
 		}
 		return nil
@@ -400,7 +400,7 @@ func cmdRemove(args []string) error {
 		if err := pool.RestoreAPIKeyHelper(saved); err != nil {
 			return err
 		}
-		fmt.Fprintln(os.Stderr, "claude-pool: left API key mode (last key removed); cc will use the Keychain account")
+		fmt.Fprintln(os.Stderr, "claude-pool: left API key mode (last key removed); cc will use the stored account credential")
 	}
 	if wasActiveAccount {
 		// The removed account still owns the live Keychain blob. Switch to a

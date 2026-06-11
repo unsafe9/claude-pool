@@ -17,6 +17,9 @@ builds:
     ldflags:
       - -s -w -X main.version=v{{ .Version }}
 
+# Asset naming is a contract with ReleaseAssetName in internal/pool/release.go
+# (self-update) and with install.sh/install.ps1 — change them together or not
+# at all. In binary format goreleaser appends ".exe" for windows itself.
 archives:
   - formats: [binary]
     name_template: "claude-pool-{{ .Os }}-{{ .Arch }}"

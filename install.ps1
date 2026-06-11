@@ -1,3 +1,4 @@
+# Asset name/URL follow the contract in internal/pool/release.go (.goreleaser.yaml).
 $ErrorActionPreference = "Stop"
 
 switch ($env:PROCESSOR_ARCHITECTURE) {

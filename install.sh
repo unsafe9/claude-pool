@@ -1,4 +1,5 @@
 #!/bin/sh
+# Asset name/URL follow the contract in internal/pool/release.go (.goreleaser.yaml).
 set -eu
 
 case "$(uname -s)" in
