@@ -1,0 +1,28 @@
+version: 2
+
+builds:
+  - main: ./cmd/claude-pool
+    binary: claude-pool
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version=v{{ .Version }}
+
+archives:
+  - formats: [binary]
+    name_template: "claude-pool-{{ .Os }}-{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: github
