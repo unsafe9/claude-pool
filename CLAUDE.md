@@ -28,10 +28,12 @@ version drift between the installed plugin and the running binary. Local/source
 builds report version `dev` and are never auto-replaced, so a working tree is
 safe to `make install` over.
 
-First-time install is automatic: SessionStart bootstrap hooks
-(`hooks/scripts/bootstrap.sh` / `bootstrap.ps1`, self-selecting by OS via
-exec-form `sh`/`powershell.exe` PATH resolution) fetch the binary through the
-bundled installers when it is missing. Manual/immediate install:
+First-time install is automatic: a string-form SessionStart bootstrap hook runs
+`hooks/scripts/bootstrap.sh` (Claude Code executes string hooks with `/bin/sh`
+on unix and with Git Bash on Windows, resolved from the Git install itself),
+which fetches the binary through the bundled installers when it is missing —
+`install.sh` on unix, `install.ps1` via `powershell.exe` on Windows. Windows
+without Git Bash has no auto-bootstrap (the hook errors); install manually:
 ```sh
 # macOS / Linux
 curl -fsSL https://raw.githubusercontent.com/unsafe9/claude-pool/main/install.sh | sh

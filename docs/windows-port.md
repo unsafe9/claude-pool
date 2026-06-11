@@ -153,6 +153,17 @@ cmd/claude-pool/
   (exec form `sh` → unix 전용 / `powershell.exe` → Windows 전용; 없는 OS에서는
   "명령 미존재 → 조용한 실패"로 자기선택). 각 훅은 바이너리 부재 시 동봉 인스톨러를
   백그라운드 실행(다음 세션 활성). 원라이너는 즉시/수동 설치용으로 유지.
+- **(후속 변경, v0.2.2)** v0.2.1의 "조용한 실패" 가정은 오류로 판명 — exec form
+  spawn 실패(`Executable not found in $PATH`)는 cc가 **항상 사용자에게 표시**
+  (cc 2.1.173 바이너리에서 확인, 억제 필드 없음). 즉 모든 플랫폼에서 매 세션
+  에러 1줄. 부트스트랩 훅 2개를 **string-form 훅 1개**로 교체: string form은
+  unix에선 `/bin/sh`, Windows에선 cc가 직접 해석한 Git Bash로 실행되어
+  (`CLAUDE_CODE_GIT_BASH_PATH` → `Program Files` 표준 경로 → PATH의 git.exe에서
+  유도; PATH의 sh와 무관) macOS/Linux/WSL/Windows+Git Bash 전부 무음+동작.
+  bootstrap.sh가 `uname` MINGW 분기로 `powershell.exe -File install.ps1`을
+  백그라운드 실행, bootstrap.ps1 삭제. 트레이드오프: Git Bash 없는 순수
+  PowerShell 환경은 자동 부트스트랩 상실(훅이 "requires bash" 에러 1줄/세션,
+  수동 원라이너로 1회 설치; exec form 메인 훅들은 그대로 동작).
 
 > 대안 B1(plugin `bin/` 동봉): `${CLAUDE_PLUGIN_ROOT}/bin/claude-pool`(확장자 없이)도
 > 실측상 Windows에서 .exe resolve되어 단일 command 가능. 완전 자동(최초도)이나 멀티-OS
@@ -215,8 +226,13 @@ hooks.json exec form 단일 command로 동작.
   cc apikey 모드에서 동작하는지 1회 확인(즉시종료 진단키로 cc 행 방지).
 - **E-linux** `human-verify`: Linux/WSL2 import→auto→swap(평문+flock; OQ-WSL2).
 - **E-win** `human-verify`: Windows+Git Bash e2e + self-update 자기교체(OQ-SelfUpdate).
-- **E-ps** `human-verify`: 순수 PowerShell(Git Bash 없는 Windows) e2e — exec form이라
-  위험 낮으나 실환경 1회 확인.
+  v0.2.2 추가 확인: string-form 부트스트랩 훅이 Git Bash로 무음 실행되는지
+  (`${CLAUDE_PLUGIN_ROOT}` 슬래시 정규화 치환, cc env의 bash에서 `nohup`/`uname`
+  가용 여부, nohup된 powershell.exe 인스톨러가 훅 종료 후 생존하는지).
+- **E-ps** `human-verify`: 순수 PowerShell(Git Bash 없는 Windows) e2e — exec form
+  메인 훅이라 위험 낮으나 실환경 1회 확인. v0.2.2부터 자동 부트스트랩 없음:
+  수동 원라이너 설치 후, string-form 훅의 "requires bash" 에러가 1줄/세션으로
+  비치명적인지 확인.
 
 ### Waves 한눈에
 - **Wave 0**(병렬): F1, F2

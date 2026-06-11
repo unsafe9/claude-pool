@@ -133,6 +133,7 @@ Source builds report version `dev` and are never replaced by the plugin's self-u
 ## Caveats
 
 - One active credential per machine: all concurrent Claude Code sessions share the credential store. Mid-session pickup of a swap is not guaranteed; restart Claude Code to apply it instantly.
+- On Windows, the first-run bootstrap runs through Git Bash (Claude Code resolves it from your Git for Windows install). Without Git for Windows there is no auto-install and the bootstrap hook reports a one-line error each session start — install the binary once with the PowerShell one-liner above; everything else works.
 - On Linux/WSL/Windows, credentials are a plaintext `~/.claude/.credentials.json` — that is Claude Code's own storage on those platforms; claude-pool reads and writes the same file in the same format (no change to your security posture either way).
 - On macOS, the first Keychain access may pop a permission prompt — choose **Always Allow** to avoid future prompts.
 - Toggling API-key mode rewrites `~/.claude/settings.json`. Symlinks are resolved and preserved, but JSON key order is not.
