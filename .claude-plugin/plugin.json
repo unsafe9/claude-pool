@@ -1,6 +1,6 @@
 {
   "name": "claude-pool",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Pool multiple Claude subscription accounts (+ API key fallback) and auto-swap Claude Code's credential on rate limits",
   "author": {
     "name": "unsafe9",
