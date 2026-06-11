@@ -17,6 +17,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -49,10 +50,16 @@ func main() {
 		err = cmdSwitch(os.Args[2:])
 	case "auto":
 		err = cmdAuto(os.Args[2:])
+	case "hook":
+		err = cmdHook(os.Args[2:])
 	case "helper":
 		err = cmdHelper()
 	case "status":
 		err = cmdStatus()
+	case "__wake":
+		err = cmdWake(os.Args[2:])
+	case "__selfupdate":
+		err = cmdSelfUpdate(os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Println(version)
 		return
@@ -92,6 +99,7 @@ Usage:
         --if-needed         Only act if the current account is over --threshold
         --threshold 0.0-1.0 Binding-utilization trigger for --if-needed (default 0.8)
         --launch            Exec `+"`claude`"+` after switching (pass cc args after --)
+  claude-pool hook <event>            plugin hook entry: session-start | background | stop-failure
   claude-pool helper                  apiKeyHelper hook for cc (managed by auto)
   claude-pool status                  Active auth profile as JSON (no network):
                                       {mode,name[,resets_at,reset_in_seconds]}
@@ -719,12 +727,10 @@ func scheduleRecoveryWake(usages []pool.Usage, errs []error) {
 	if pool.PendingWakeBefore(target) {
 		return
 	}
-	exe, err := os.Executable()
-	if err != nil {
-		return
-	}
-	if err := pool.StartDetached(exec.Command("/bin/sh", "-c",
-		fmt.Sprintf("sleep %d; exec %s auto", int(delay.Seconds()), shQuote(exe)))); err != nil {
+	// Spawn a detached `__wake N` that sleeps then re-runs auto. This is the
+	// portable replacement for the unix-only `/bin/sh -c "sleep N; exec <exe>
+	// auto"`, working on Windows too.
+	if err := spawnDetached("__wake", strconv.Itoa(int(delay.Seconds()))); err != nil {
 		return
 	}
 	pool.RecordWake(target)
