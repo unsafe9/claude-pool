@@ -8,5 +8,5 @@
   },
   "repository": "https://github.com/unsafe9/claude-pool",
   "license": "MIT",
-  "keywords": ["accounts", "rate-limit", "credentials", "hooks", "macos"]
+  "keywords": ["accounts", "rate-limit", "credentials", "hooks", "windows", "linux", "macos"]
 }

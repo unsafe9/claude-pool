@@ -6,7 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/claude-pool-run.sh\" session-start",
+            "command": "claude-pool",
+            "args": ["hook", "session-start"],
             "timeout": 20
           }
         ]
@@ -17,7 +18,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/claude-pool-run.sh\" background",
+            "command": "claude-pool",
+            "args": ["hook", "background"],
             "timeout": 5
           }
         ]
@@ -29,7 +31,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/scripts/claude-pool-run.sh\" stop-failure",
+            "command": "claude-pool",
+            "args": ["hook", "stop-failure"],
             "timeout": 20
           }
         ]
