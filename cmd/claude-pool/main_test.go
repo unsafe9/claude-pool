@@ -92,4 +92,8 @@ func TestIsOurHelper(t *testing.T) {
 	if isOurHelper("") {
 		t.Error("empty value must not match")
 	}
+	// Windows cmd.exe format: double-quoted path.
+	if !isOurHelper(`"C:\Users\u\.local\bin\claude-pool.exe" helper`) {
+		t.Error("windows double-quoted claude-pool.exe helper should match")
+	}
 }
