@@ -66,19 +66,6 @@ func TestSoonestRecovery(t *testing.T) {
 	}
 }
 
-func TestShQuote(t *testing.T) {
-	cases := []struct{ in, want string }{
-		{"/Users/x/go/bin/claude-pool", "'/Users/x/go/bin/claude-pool'"},
-		{"/Users/J Doe/bin/claude-pool", "'/Users/J Doe/bin/claude-pool'"},
-		{"/odd/it's/claude-pool", `'/odd/it'\''s/claude-pool'`},
-	}
-	for _, c := range cases {
-		if got := shQuote(c.in); got != c.want {
-			t.Errorf("shQuote(%q) = %q, want %q", c.in, got, c.want)
-		}
-	}
-}
-
 func TestIsOurHelper(t *testing.T) {
 	if !isOurHelper("'/Users/x/go/bin/claude-pool' helper") {
 		t.Error("quoted claude-pool helper should match")

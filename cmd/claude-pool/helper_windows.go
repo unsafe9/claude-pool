@@ -2,10 +2,7 @@
 
 package main
 
-import (
-	"os"
-	"strings"
-)
+import "os"
 
 // helperCommand returns the apiKeyHelper command line for this binary. On
 // Windows cc runs the value with cmd.exe, where single quotes are literal —
@@ -16,10 +13,4 @@ func helperCommand() (string, error) {
 		return "", err
 	}
 	return `"` + exe + `" helper`, nil
-}
-
-// shQuote is referenced from OS-neutral code and will be removed once the
-// recovery waker stops shelling out.
-func shQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
