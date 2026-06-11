@@ -18,8 +18,12 @@ Move-Item -Force $tmp $exe
 
 & $exe version
 
+# Unlike unix, $dir is not conventionally on PATH on Windows, and the exec-form
+# hooks resolve claude-pool.exe through the PATH Claude Code inherited — so add
+# it to the user PATH (registry; broadcasts the change to new terminals).
 $userPath = [Environment]::GetEnvironmentVariable("PATH", "User")
 if ($userPath -notlike "*$dir*") {
-    Write-Host "hint: add $dir to your PATH:"
-    Write-Host "  [Environment]::SetEnvironmentVariable('PATH', `"$dir;`$env:PATH`", 'User')"
+    $newPath = if ([string]::IsNullOrEmpty($userPath)) { $dir } else { "$userPath;$dir" }
+    [Environment]::SetEnvironmentVariable("PATH", $newPath, "User")
+    Write-Host "added $dir to your user PATH (open a new terminal to pick it up)"
 }

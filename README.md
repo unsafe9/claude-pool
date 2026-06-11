@@ -27,7 +27,7 @@ Three hooks do the work:
 
 `auto` is a silent no-op while the pool is empty, so the install order never matters.
 
-To install the binary immediately instead of waiting a session (or to use the CLI without the plugin), run the installer one-liner — it targets `~/.local/bin`, which is normally already on your `PATH` (Claude Code lives there too):
+To install the binary immediately instead of waiting a session (or to use the CLI without the plugin), run the installer one-liner — it targets `~/.local/bin`. On macOS/Linux that is normally already on your `PATH` (Claude Code lives there too); on Windows the installer adds it to your user `PATH` if missing (open a new terminal — and restart Claude Code — to pick it up):
 
 ```sh
 # macOS / Linux / WSL

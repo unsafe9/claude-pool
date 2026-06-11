@@ -164,6 +164,12 @@ cmd/claude-pool/
   백그라운드 실행, bootstrap.ps1 삭제. 트레이드오프: Git Bash 없는 순수
   PowerShell 환경은 자동 부트스트랩 상실(훅이 "requires bash" 에러 1줄/세션,
   수동 원라이너로 1회 설치; exec form 메인 훅들은 그대로 동작).
+- **(후속 변경, v0.2.3)** Windows 실측에서 `uv_spawn 'claude-pool'` ENOENT 지속
+  가능성 발견: `%USERPROFILE%\.local\bin`은 Windows 기본 PATH가 아니므로
+  (cc를 npm으로 설치한 경우 등) 설치 후에도 exec form 훅이 영구히 실패할 수
+  있다. install.ps1이 user PATH(레지스트리)에 디렉토리를 직접 추가하도록 변경
+  (WM_SETTINGCHANGE 브로드캐스트 포함, 새 터미널부터 반영). unix는 관례상
+  이미 PATH라 힌트 출력 유지.
 
 > 대안 B1(plugin `bin/` 동봉): `${CLAUDE_PLUGIN_ROOT}/bin/claude-pool`(확장자 없이)도
 > 실측상 Windows에서 .exe resolve되어 단일 command 가능. 완전 자동(최초도)이나 멀티-OS
