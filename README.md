@@ -1,6 +1,6 @@
 # claude-pool
 
-Credential pooler for [Claude Code](https://github.com/anthropics/claude-code) on macOS. Pools multiple Claude subscription accounts — plus Anthropic API keys as a last resort — and automatically keeps Claude Code on whichever credential has the most rate-limit headroom.
+Credential pooler for [Claude Code](https://github.com/anthropics/claude-code). Pools multiple Claude subscription accounts — plus Anthropic API keys as a last resort — and automatically keeps Claude Code on whichever credential has the most rate-limit headroom. Works on macOS, Linux, WSL, and Windows (Git Bash or plain PowerShell).
 
 No proxy, no man-in-the-middle: Claude Code talks to `api.anthropic.com` directly. claude-pool only manages which credential it holds.
 
@@ -13,9 +13,20 @@ claude-pool ships as a Claude Code plugin — installing it is all the setup the
 /plugin install claude-pool@claude-pool
 ```
 
-On the next session start the plugin takes care of the rest:
+Then install the binary once — it goes to `~/.local/bin`, which is normally already on your `PATH` (Claude Code lives there too):
 
-- downloads the prebuilt `claude-pool` binary (Apple Silicon) for the plugin's version from GitHub Releases into `$GOBIN` (default `~/go/bin`), in the background — and re-downloads it whenever a plugin update outpaces the local binary (locally built `dev` binaries are left alone);
+```sh
+# macOS / Linux / WSL
+curl -fsSL https://raw.githubusercontent.com/unsafe9/claude-pool/main/install.sh | sh
+```
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/unsafe9/claude-pool/main/install.ps1 | iex
+```
+
+From the next session start the plugin takes care of the rest:
+
+- keeps the binary in step with the plugin's version by self-updating in the background whenever a plugin update outpaces it (locally built `dev` binaries are left alone);
 - imports the account you are currently logged into as the pool's first account;
 - from then on, hooks keep the pool balanced and swap credentials — no manual commands needed.
 
@@ -37,7 +48,7 @@ claude-pool import                 # auto-named after the account email (or a ti
 claude-pool import --id work       # or name it yourself
 ```
 
-If `claude-pool` is not on your `PATH`, it is at `~/go/bin/claude-pool`.
+If `claude-pool` is not on your `PATH`, it is at `~/.local/bin/claude-pool`.
 
 Importing also makes that account the active one. Re-importing the same account (same `--id`, or auto-named by the same email) refreshes the stored credential without creating a duplicate.
 
@@ -51,9 +62,9 @@ claude-pool key add --id console2              # paste at the prompt (input hidd
 
 ## How it works
 
-- **Account mode** (the default, preferred state): the chosen account's OAuth credential is written into the macOS Keychain item Claude Code reads (`Claude Code-credentials`). Expiring tokens are refreshed before use.
+- **Account mode** (the default, preferred state): the chosen account's OAuth credential is written into Claude Code's own credential store — the macOS Keychain item `Claude Code-credentials`, or `~/.claude/.credentials.json` on Linux/WSL/Windows (the same plaintext file Claude Code itself uses there). Expiring tokens are refreshed before use.
 - **Selection**: each account is scored by its *binding utilization* — `max(5-hour %, 7-day %)` from the subscription usage API (`/api/oauth/usage`). `auto` polls all accounts concurrently and activates the one with the lowest score.
-- **API-key fallback**: accounts always win. Only when *every* successfully polled account sits at 100% does `auto` flip to API keys, by setting `apiKeyHelper` in `~/.claude/settings.json` — `apiKeyHelper` outranks the Keychain OAuth credential in Claude Code's documented [authentication precedence](https://code.claude.com/docs/en/authentication.md#authentication-precedence), and settings changes hot-reload into running sessions. The helper round-robins across registered keys on each invocation.
+- **API-key fallback**: accounts always win. Only when *every* successfully polled account sits at 100% does `auto` flip to API keys, by setting `apiKeyHelper` in `~/.claude/settings.json` — `apiKeyHelper` outranks the stored OAuth credential in Claude Code's documented [authentication precedence](https://code.claude.com/docs/en/authentication.md#authentication-precedence), and settings changes hot-reload into running sessions. The helper round-robins across registered keys on each invocation.
 - **Recovery**: API-key time is billed time, so leaving it is aggressive. Three triggers race to get you back on subscription auth the moment any account resets below 100%:
   1. every `auto` run (hooks) re-polls all accounts while in API-key mode;
   2. the helper itself probes the accounts each time Claude Code asks it for a key — i.e. exactly when money is about to be spent — and switches back on the spot (the key it prints bridges only the in-flight request);
@@ -65,9 +76,9 @@ account mode ◀──(any account resets)───── API-key mode
 ```
 
 - **Errors are not exhaustion**: an account whose usage poll fails is skipped, not treated as exhausted — and if every poll fails, `auto` stays on the current credential instead of dumping you onto API keys over a network blip.
-- **Self-healing**: every run reconciles the store, settings, and Keychain. Hand-deleting the `apiKeyHelper` is respected. A credential that Claude Code itself refreshed in the Keychain is harvested back into the pool (attributed to the right account by email via the profile API). A foreign `apiKeyHelper` you already had is preserved and restored when claude-pool leaves API-key mode.
+- **Self-healing**: every run reconciles the store, settings, and credential store. Hand-deleting the `apiKeyHelper` is respected. A credential that Claude Code itself refreshed is harvested back into the pool (attributed to the right account by email via the profile API). A foreign `apiKeyHelper` you already had is preserved and restored when claude-pool leaves API-key mode.
 
-State lives in `~/.config/claude-pool/pool.json` (mode 0600), flock-protected against concurrent hook/helper runs.
+State lives in `~/.config/claude-pool/pool.json` (mode 0600), lock-protected (flock; `LockFileEx` on Windows) against concurrent hook/helper runs.
 
 ## CLI
 
@@ -99,15 +110,15 @@ claude-pool auto --launch -- --continue        # switch, then exec `claude --con
 
 `--launch` always execs `claude` afterwards, even if the pool step failed — a pool error never blocks Claude Code from starting on whatever credential it already holds.
 
-### Installing the binary without the plugin
+### Building from source
 
-The plugin bootstraps the binary automatically; install it by hand only to use the CLI standalone:
+The install scripts above fetch a prebuilt binary; build from source if you prefer:
 
 ```bash
 go install github.com/unsafe9/claude-pool/cmd/claude-pool@latest
 ```
 
-Or from source:
+Or from a clone:
 
 ```bash
 git clone https://github.com/unsafe9/claude-pool.git
@@ -115,11 +126,13 @@ cd claude-pool
 make install   # = go install ./cmd/claude-pool
 ```
 
+Source builds report version `dev` and are never replaced by the plugin's self-update.
+
 ## Caveats
 
-- macOS only — credentials move through the `security` CLI and the Keychain.
-- One active credential per machine: all concurrent Claude Code sessions share whatever is in the Keychain. Mid-session pickup of a swap is not guaranteed; restart Claude Code to apply it instantly.
-- The first Keychain access may pop a permission prompt — choose **Always Allow** to avoid future prompts.
+- One active credential per machine: all concurrent Claude Code sessions share the credential store. Mid-session pickup of a swap is not guaranteed; restart Claude Code to apply it instantly.
+- On Linux/WSL/Windows, credentials are a plaintext `~/.claude/.credentials.json` — that is Claude Code's own storage on those platforms; claude-pool reads and writes the same file in the same format (no change to your security posture either way).
+- On macOS, the first Keychain access may pop a permission prompt — choose **Always Allow** to avoid future prompts.
 - Toggling API-key mode rewrites `~/.claude/settings.json`. Symlinks are resolved and preserved, but JSON key order is not.
 - Running multiple consumer subscription accounts may sit against Anthropic's consumer terms of service. Use at your own risk.
 
