@@ -2,12 +2,13 @@
 
 package pool
 
-import "errors"
+// readCredential and writeCredential back the credential store on Linux and
+// Windows using Claude Code's plaintext JSON file (~/.claude/.credentials.json).
 
 func readCredential() (string, error) {
-	return "", errors.New("credential store: not implemented on this platform yet")
+	return readCredFile()
 }
 
 func writeCredential(blob string) error {
-	return errors.New("credential store: not implemented on this platform yet")
+	return writeCredFile(blob)
 }
