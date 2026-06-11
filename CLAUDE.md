@@ -1,8 +1,9 @@
 # claude-pool
 
-Credential pooler for Claude Code on macOS: pools subscription accounts (+ API
-key fallback) and swaps cc's active credential on rate limits. Ships as a Claude
-Code plugin. macOS-only, no cgo (Keychain access is via the `security` CLI).
+Credential pooler for Claude Code: pools subscription accounts (+ API key
+fallback) and swaps cc's active credential on rate limits. Ships as a Claude
+Code plugin. Supports macOS (Keychain via `security` CLI), Linux, WSL, and
+Windows (plaintext `~/.claude/.credentials.json`). No cgo.
 
 - Source: `cmd/claude-pool` (CLI + hook entry points), `internal/pool` (store,
   oauth, keychain, usage).
@@ -10,19 +11,27 @@ Code plugin. macOS-only, no cgo (Keychain access is via the `security` CLI).
 
 ## Releasing
 
-Binaries are published by `.github/workflows/release.yml` on every `v*` tag,
-cross-compiled for Apple Silicon (`darwin/arm64`).
+Binaries are published by `.github/workflows/release.yml` (via goreleaser,
+config `.goreleaser.yaml`) on every `v*` tag, for all combinations of
+darwin/linux/windows × amd64/arm64. Assets are named
+`claude-pool-<os>-<arch>` (`.exe` on Windows).
 
 1. Bump `version` in `.claude-plugin/plugin.json` (semver, **no** `v` prefix).
 2. Commit, then tag and push the matching tag:
    ```bash
    git tag v0.1.1 && git push origin v0.1.1
    ```
-3. The workflow builds `claude-pool-darwin-arm64` with
-   `-ldflags "-X main.version=v0.1.1"` and attaches it to a GitHub Release.
 
 The plugin version and the release tag **must match**: the session-start hook
-(`hooks/scripts/claude-pool-run.sh`) reads the installed plugin's version and
-downloads the same-tagged release binary when the local one is missing or
-outdated. Local/source builds report version `dev` and are never auto-replaced,
-so a working tree is safe to `make install` over.
+(`claude-pool hook session-start`) self-updates the binary when it detects a
+version drift between the installed plugin and the running binary. Local/source
+builds report version `dev` and are never auto-replaced, so a working tree is
+safe to `make install` over.
+
+First-time install:
+```sh
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/unsafe9/claude-pool/main/install.sh | sh
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/unsafe9/claude-pool/main/install.ps1 | iex
+```
