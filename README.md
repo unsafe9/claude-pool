@@ -1,6 +1,6 @@
 # claude-pool
 
-Credential pooler for [Claude Code](https://github.com/anthropics/claude-code). Pools multiple Claude subscription accounts — plus Anthropic API keys as a last resort — and automatically keeps Claude Code on whichever credential has the most rate-limit headroom. Works on macOS, Linux, WSL, and Windows (Git Bash or plain PowerShell).
+Credential pooler for [Claude Code](https://github.com/anthropics/claude-code). Pools multiple Claude subscription accounts — plus Anthropic API keys as a last resort — and automatically keeps Claude Code on whichever credential has the most rate-limit headroom. Works on macOS, Linux, WSL, and Windows (Git Bash, or plain PowerShell with a one-time manual binary install — see Caveats).
 
 No proxy, no man-in-the-middle: Claude Code talks to `api.anthropic.com` directly. claude-pool only manages which credential it holds.
 
@@ -15,7 +15,7 @@ claude-pool ships as a Claude Code plugin — installing it is all the setup the
 
 From the next session start the plugin takes care of the rest:
 
-- installs the `claude-pool` binary into `~/.local/bin` on first run (in the background, active the session after), and keeps it in step with the plugin's version by self-updating whenever a plugin update outpaces it (locally built `dev` binaries are left alone);
+- installs the `claude-pool` binary into `~/.local/bin` on first run (in the background, active the session after; on Windows this requires Git for Windows and puts the directory on your user `PATH` — restart the terminal once if hooks still report it missing), and keeps it in step with the plugin's version by self-updating whenever a plugin update outpaces it (locally built `dev` binaries are left alone);
 - imports the account you are currently logged into as the pool's first account;
 - from then on, hooks keep the pool balanced and swap credentials — no manual commands needed.
 

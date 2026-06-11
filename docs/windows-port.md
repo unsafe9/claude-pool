@@ -170,6 +170,19 @@ cmd/claude-pool/
   있다. install.ps1이 user PATH(레지스트리)에 디렉토리를 직접 추가하도록 변경
   (WM_SETTINGCHANGE 브로드캐스트 포함, 새 터미널부터 반영). unix는 관례상
   이미 PATH라 힌트 출력 유지.
+- **(후속 변경, v0.2.4, code-review)** 인스톨러·부트스트랩 강화:
+  (1) "설치됐지만 PATH 미반영" 고착 해소 — bootstrap.sh Windows 분기가 exe
+  존재 가드로 빠지지 않고 install.ps1을 재실행(인스톨러가 정상 바이너리면
+  다운로드 생략, PATH만 수리 → 수렴). 기존 v0.2.1 설치자의 self-update가 죽은
+  훅에 게이트되는 문제도 이 경로로 회복. (2) 다운로드 검증 후 커밋 — 두
+  인스톨러 모두 temp에서 `version` 자가검사 후 최종 경로로 이동(캡티브 포털
+  HTML 200 → 영구 고착 방지), install.ps1 temp는 $PID 고유화(동시 실행 레이스).
+  (3) PATH 추가를 raw 레지스트리로 — `[Environment]::SetEnvironmentVariable`은
+  REG_EXPAND_SZ를 REG_SZ로 강등(%VAR% 동결, dotnet/runtime#89695); kind 보존 +
+  수동 WM_SETTINGCHANGE 브로드캐스트, 세그먼트 단위 PATH 검사(-notlike 부분
+  문자열 오탐 제거). (4) install.sh의 MINGW 거부를 install.ps1 위임으로 교체
+  (Git Bash에서 curl 원라이너도 동작; 구 설계의 "이중 발화 방지" 역할은
+  bootstrap.sh 자체 분기로 대체됨).
 
 > 대안 B1(plugin `bin/` 동봉): `${CLAUDE_PLUGIN_ROOT}/bin/claude-pool`(확장자 없이)도
 > 실측상 Windows에서 .exe resolve되어 단일 command 가능. 완전 자동(최초도)이나 멀티-OS
