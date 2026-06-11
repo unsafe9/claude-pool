@@ -34,12 +34,14 @@ func replaceExecutable(tmp, exe string) error {
 	return nil
 }
 
-// renameRetry retries os.Rename with a growing sleep — antivirus can hold a
-// brief lock on a just-written binary.
+// renameRetry retries os.Rename with a growing sleep. Real-time antivirus
+// scans a just-downloaded executable and can hold it locked for several
+// seconds, so the backoff totals ~12.7s — cheap here, since the self-update
+// runs in a detached process nothing waits on.
 func renameRetry(from, to string) error {
 	var err error
 	delay := 50 * time.Millisecond
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 8; i++ {
 		if err = os.Rename(from, to); err == nil {
 			return nil
 		}

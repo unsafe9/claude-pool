@@ -73,14 +73,14 @@ func hookSessionStart() error {
 		_ = spawnDetached("__selfupdate", "v"+normVersion(want))
 	}
 
-	// 3. Empty-pool import (port). Run import as a subprocess with stdout AND
-	// stderr discarded so cmdImport's stdout can't leak into the session-start
-	// context. Best-effort: ignore the error.
+	// 3. Empty-pool import (port). Run import as a subprocess with stdout
+	// discarded so cmdImport's stdout can't leak into the session-start
+	// context; stderr is inherited so a persistently failing first-run import
+	// stays diagnosable. Best-effort: ignore the error.
 	if s, err := pool.Load(); err == nil && len(s.Accounts) == 0 && len(s.APIKeys) == 0 {
 		if exe, err := os.Executable(); err == nil {
 			cmd := exec.Command(exe, "import")
-			cmd.Stdout = nil
-			cmd.Stderr = nil
+			cmd.Stderr = os.Stderr
 			_ = cmd.Run()
 		}
 	}
