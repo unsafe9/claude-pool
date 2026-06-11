@@ -93,10 +93,18 @@ claude-pool helper         # apiKeyHelper hook for cc (managed by auto, not for 
 claude-pool version        # build version
 ```
 
-`status` is network-free, so a custom statusline script can call it on every render. It prints `{"mode","name"}` — `mode` is `account` or `apikey`, `name` is the active account or key id — and in API-key mode adds `"resets_at"` and `"reset_in_seconds"`: how long until an account is expected to free up and subscription auth resumes (read from the usage cache, omitted when unknown). Parse it with `jq`:
+`status` is network-free, so a custom statusline script can call it on every render. It prints `{"mode","name"}` — `mode` is `account` or `apikey`, `name` is the active account or key id — and in API-key mode adds `"resets_at"` and `"reset_in_seconds"`: how long until an account is expected to free up and subscription auth resumes (read from the usage cache, omitted when unknown). For example, in a Claude Code [statusLine](https://code.claude.com/docs/en/statusline.md) script — a gray `[work]` on subscription, a red `[key:console2 40m]` billing warning while on an API key:
 
-```bash
-claude-pool status | jq -r '.mode'   # account | apikey
+```sh
+json=$(claude-pool status 2>/dev/null)
+mode=$(printf '%s' "$json" | jq -r '.mode // empty')
+name=$(printf '%s' "$json" | jq -r '.name // empty')
+if [ "$mode" = "apikey" ]; then
+  secs=$(printf '%s' "$json" | jq -r '.reset_in_seconds // empty')
+  printf '\033[91m[key:%s%s]\033[0m' "$name" "${secs:+ $(( (secs + 59) / 60 ))m}"
+elif [ -n "$name" ]; then
+  printf '\033[90m[%s]\033[0m' "$name"
+fi
 ```
 
 Manual swapping, for use outside the hooks:
