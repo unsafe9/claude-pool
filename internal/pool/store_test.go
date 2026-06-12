@@ -1,15 +1,18 @@
 package pool
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 )
 
 func TestStore_RoundTripAndUpsert(t *testing.T) {
+	withMachineID(t, "test-machine-id")
 	dir := t.TempDir()
 	path := filepath.Join(dir, "accounts.json")
+	prev := StorePath
+	StorePath = func() (string, error) { return path, nil }
+	t.Cleanup(func() { StorePath = prev })
 
 	s := &Store{path: path}
 	s.Upsert(&Account{ID: "alice", Blob: `{"claudeAiOauth":{"accessToken":"a"}}`})
@@ -28,10 +31,9 @@ func TestStore_RoundTripAndUpsert(t *testing.T) {
 		t.Errorf("perm = %o, want 600", perm)
 	}
 
-	// Reload from disk.
-	s2 := &Store{path: path}
-	data, _ := os.ReadFile(path)
-	if err := json.Unmarshal(data, s2); err != nil {
+	// Reload from disk (decrypts the now-encrypted store).
+	s2, err := Load()
+	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
 	if len(s2.Accounts) != 2 || s2.Current != "alice" {

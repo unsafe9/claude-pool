@@ -78,7 +78,16 @@ account mode ◀──(any account resets)───── API-key mode
 - **Errors are not exhaustion**: an account whose usage poll fails is skipped, not treated as exhausted — and if every poll fails, `auto` stays on the current credential instead of dumping you onto API keys over a network blip.
 - **Self-healing**: every run reconciles the store, settings, and credential store. Hand-deleting the `apiKeyHelper` is respected. A credential that Claude Code itself refreshed is harvested back into the pool (attributed to the right account by email via the profile API). A foreign `apiKeyHelper` you already had is preserved and restored when claude-pool leaves API-key mode.
 
-State lives in `~/.config/claude-pool/pool.json` (mode 0600), lock-protected (flock; `LockFileEx` on Windows) against concurrent hook/helper runs.
+State lives in `~/.config/claude-pool/pool.json` (mode 0600), lock-protected (flock; `LockFileEx` on Windows) against concurrent hook/helper runs. The file is encrypted at rest with machine-bound AES-256-GCM — see [Security](#security).
+
+## Security
+
+`pool.json` holds your pooled OAuth credentials and API keys, so it is encrypted at rest with **machine-bound AES-256-GCM** (stdlib crypto only; the key is derived via HKDF-SHA256 from the machine id and username). A pre-existing plaintext file is read transparently and re-written encrypted on the next save.
+
+This is a deliberately narrow defense, and worth being honest about:
+
+- **What it protects against:** automated credential scanners / info-stealers grepping known paths for `sk-ant-`, JWTs, or JSON key names, and accidental plaintext leaks (a stray git commit, screenshot, log, or backup). It also means one machine's `pool.json` is useless if copied to another machine.
+- **What it does *not* protect against:** a targeted local attacker. The key derivation is open source and the tool must decrypt unattended (no passphrase, OS keychain, or biometric prompt), so anyone who can run code as you on your machine can recover the keys. Treat this as obfuscation against bulk/accidental exposure, not as strong encryption.
 
 ## CLI
 

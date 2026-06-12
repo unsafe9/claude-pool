@@ -1,7 +1,9 @@
 package pool
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"time"
@@ -62,6 +64,9 @@ var StorePath = func() (string, error) {
 }
 
 // Load reads the store, returning an empty store if the file does not exist yet.
+// On-disk it is machine-bound AES-256-GCM (see crypto.go); a legacy plaintext
+// JSON file (starting with '{') is still read, and the next Save re-writes it
+// encrypted, so plaintext disappears on first write.
 func Load() (*Store, error) {
 	path, err := StorePath()
 	if err != nil {
@@ -75,6 +80,11 @@ func Load() (*Store, error) {
 		}
 		return nil, err
 	}
+	if bytes.HasPrefix(data, storeMagic) {
+		if data, err = decrypt(data); err != nil {
+			return nil, fmt.Errorf("decrypt %s: %w; the store was likely encrypted on a different machine or under a different user — remove it and re-import accounts", path, err)
+		}
+	}
 	if err := json.Unmarshal(data, s); err != nil {
 		return nil, err
 	}
@@ -82,7 +92,8 @@ func Load() (*Store, error) {
 	return s, nil
 }
 
-// Save writes the store atomically with 0600 permissions.
+// Save writes the store atomically with 0600 permissions. The bytes hitting disk
+// (including the .tmp staging file) are encrypted, never plaintext.
 func (s *Store) Save() error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0o700); err != nil {
 		return err
@@ -91,8 +102,12 @@ func (s *Store) Save() error {
 	if err != nil {
 		return err
 	}
+	enc, err := encrypt(data)
+	if err != nil {
+		return err
+	}
 	tmp := s.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	if err := os.WriteFile(tmp, enc, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, s.path)
