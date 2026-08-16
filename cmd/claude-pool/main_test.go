@@ -39,6 +39,14 @@ func TestUsableAt(t *testing.T) {
 	}); !got.IsZero() {
 		t.Errorf("unknown-reset usableAt = %v, want zero", got)
 	}
+	// Only a model-scoped window exhausted → its reset.
+	if got := usableAt(pool.Usage{
+		FiveHour: pool.Window{Pct: 20, ResetsAt: in1h},
+		SevenDay: pool.Window{Pct: 50, ResetsAt: in1h},
+		Scoped:   []pool.Window{{Pct: 100, ResetsAt: in2h, Label: "Fable"}},
+	}); !got.Equal(in2h) {
+		t.Errorf("scoped-bound usableAt = %v, want %v", got, in2h)
+	}
 }
 
 func TestSoonestRecovery(t *testing.T) {

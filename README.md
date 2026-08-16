@@ -63,7 +63,8 @@ claude-pool key add --id console2              # paste at the prompt (input hidd
 ## How it works
 
 - **Account mode** (the default, preferred state): the chosen account's OAuth credential is written into Claude Code's own credential store — the macOS Keychain item `Claude Code-credentials`, or `~/.claude/.credentials.json` on Linux/WSL/Windows (the same plaintext file Claude Code itself uses there). Expiring tokens are refreshed before use.
-- **Selection**: each account is scored by its *binding utilization* — `max(5-hour %, 7-day %)` from the subscription usage API (`/api/oauth/usage`). `auto` polls all accounts concurrently and activates the one with the lowest score.
+- **Selection**: each account is scored by its *binding utilization* — the most-constrained rate-limit window from the subscription usage API (`/api/oauth/usage`). `auto` polls all accounts concurrently and activates the one with the lowest score.
+- **Rate-limit windows**: the account-wide 5-hour and 7-day windows, plus every model-scoped window the API reports (Fable, for instance, has its own weekly quota). A model-scoped window counts the same as an account-wide one, so an account with its Fable quota spent is treated as exhausted even while its overall quota still has headroom — that is what makes a Fable limit trigger a swap. `list` tags those windows with the model: `4%/4h40m 54%/1d23h Fable:97%/1d23h`. Opt out with `claude-pool config scoped-limits off` if you don't run the scoped model and would rather spend the account-wide quota — the tagged windows then disappear from `list` too, since the whole tool stops seeing them.
 - **API-key fallback**: accounts always win. Only when *every* successfully polled account sits at 100% does `auto` flip to API keys, by setting `apiKeyHelper` in `~/.claude/settings.json` — `apiKeyHelper` outranks the stored OAuth credential in Claude Code's documented [authentication precedence](https://code.claude.com/docs/en/authentication.md#authentication-precedence), and settings changes hot-reload into running sessions. The helper round-robins across registered keys on each invocation.
 - **Recovery**: API-key time is billed time, so leaving it is aggressive. Three triggers race to get you back on subscription auth the moment any account resets below 100%:
   1. every `auto` run (hooks) re-polls all accounts while in API-key mode;
@@ -94,9 +95,11 @@ This is a deliberately narrow defense, and worth being honest about:
 The hooks drive everything through `claude-pool auto`; the same binary doubles as a CLI for inspecting and steering the pool by hand.
 
 ```bash
-claude-pool list           # accounts with live 5h/7d usage, then keys
+claude-pool list           # accounts with live usage per window, then keys
 claude-pool switch work    # switch to a specific account
 claude-pool rm console1    # remove an account or API key
+claude-pool config         # show settings
+claude-pool config scoped-limits off   # stop counting model-scoped quotas (e.g. Fable)
 claude-pool status         # active auth profile as JSON (no network)
 claude-pool helper         # apiKeyHelper hook for cc (managed by auto, not for manual use)
 claude-pool version        # build version

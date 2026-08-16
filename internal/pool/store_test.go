@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestStore_RoundTripAndUpsert(t *testing.T) {
@@ -84,5 +85,54 @@ func TestStore_APIKeysAndRemove(t *testing.T) {
 	}
 	if s.NextKey().ID != "k2" {
 		t.Errorf("NextKey after removal broken")
+	}
+}
+
+// Opting out must reach the CACHED usages, not just fresh polls: while in
+// API-key mode the cache alone decides whether to re-poll, so a stale scoped
+// window would otherwise pin the pool to billed keys until its multi-day reset.
+func TestLoad_IgnoreScopedLimitsStripsCachedUsage(t *testing.T) {
+	withMachineID(t, "test-machine-id")
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pool.json")
+	prev := StorePath
+	StorePath = func() (string, error) { return path, nil }
+	t.Cleanup(func() { StorePath = prev })
+
+	exhausted := Usage{
+		FiveHour: Window{Pct: 20},
+		SevenDay: Window{Pct: 54},
+		Scoped:   []Window{{Pct: 100, Label: "Fable", ResetsAt: time.Now().Add(48 * time.Hour)}},
+	}
+	s := &Store{path: path}
+	s.Upsert(&Account{ID: "alice", Blob: `{"claudeAiOauth":{"accessToken":"a"}}`})
+	s.Accounts[0].Usage = &exhausted
+	if err := s.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	// Opted in (the default): the Fable window still binds.
+	got, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if score := got.Accounts[0].Usage.Score(); score != 100 {
+		t.Errorf("opted-in Score = %v, want 100", score)
+	}
+
+	got.IgnoreScopedLimits = true
+	got.path = path
+	if err := got.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	got, err = Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if n := len(got.Accounts[0].Usage.Scoped); n != 0 {
+		t.Errorf("opted-out cached usage kept %d scoped window(s), want 0", n)
+	}
+	if score := got.Accounts[0].Usage.Score(); score != 54 {
+		t.Errorf("opted-out Score = %v, want 54 (account-wide windows only)", score)
 	}
 }

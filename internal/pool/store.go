@@ -42,14 +42,19 @@ const (
 // the Keychain. CurrentKey and KeyCursor track the round-robin position over
 // APIKeys while in apikey mode. SavedHelper preserves a foreign apiKeyHelper
 // value we displaced on entering apikey mode, so leaving restores it.
+//
+// IgnoreScopedLimits opts out of model-scoped rate-limit windows (Fable's own
+// weekly quota, say), so only the account-wide 5-hour and 7-day windows decide
+// exhaustion. The zero value keeps them in force.
 type Store struct {
-	Mode        string     `json:"mode,omitempty"`
-	Current     string     `json:"current,omitempty"`
-	CurrentKey  string     `json:"current_key,omitempty"`
-	KeyCursor   int        `json:"key_cursor,omitempty"`
-	SavedHelper string     `json:"saved_api_key_helper,omitempty"`
-	Accounts    []*Account `json:"accounts"`
-	APIKeys     []*APIKey  `json:"api_keys,omitempty"`
+	Mode               string     `json:"mode,omitempty"`
+	Current            string     `json:"current,omitempty"`
+	CurrentKey         string     `json:"current_key,omitempty"`
+	KeyCursor          int        `json:"key_cursor,omitempty"`
+	SavedHelper        string     `json:"saved_api_key_helper,omitempty"`
+	IgnoreScopedLimits bool       `json:"ignore_scoped_limits,omitempty"`
+	Accounts           []*Account `json:"accounts"`
+	APIKeys            []*APIKey  `json:"api_keys,omitempty"`
 
 	path string
 }
@@ -89,7 +94,25 @@ func Load() (*Store, error) {
 		return nil, err
 	}
 	s.path = path
+	s.applyLimitPolicy()
 	return s, nil
+}
+
+// applyLimitPolicy strips model-scoped windows from the cached usages when the
+// pool has opted out of them. Without this, opting out would not take effect
+// until every account re-polled: the cache alone can hold the pool in API-key
+// mode (see stillExhausted / soonestRecovery), for as long as the scoped
+// window's multi-day reset.
+func (s *Store) applyLimitPolicy() {
+	if !s.IgnoreScopedLimits {
+		return
+	}
+	for _, a := range s.Accounts {
+		if a.Usage != nil {
+			u := a.Usage.WithoutScoped()
+			a.Usage = &u
+		}
+	}
 }
 
 // Save writes the store atomically with 0600 permissions. The bytes hitting disk

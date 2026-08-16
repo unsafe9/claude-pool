@@ -54,6 +54,8 @@ func main() {
 		err = cmdHook(os.Args[2:])
 	case "helper":
 		err = cmdHelper()
+	case "config":
+		err = cmdConfig(os.Args[2:])
 	case "status":
 		err = cmdStatus()
 	case "__wake":
@@ -99,6 +101,10 @@ Usage:
         --if-needed         Only act if the current account is over --threshold
         --threshold 0.0-1.0 Binding-utilization trigger for --if-needed (default 0.8)
         --launch            Exec `+"`claude`"+` after switching (pass cc args after --)
+  claude-pool config [SETTING [on|off]]
+                                      Show settings, or set one:
+        scoped-limits       Count model-scoped quotas (e.g. Fable's own weekly
+                            window) toward exhaustion (default on)
   claude-pool hook <event>            plugin hook entry: session-start | background | stop-failure
   claude-pool helper                  apiKeyHelper hook for cc (managed by auto)
   claude-pool status                  Active auth profile as JSON (no network):
@@ -159,13 +165,23 @@ func ensureFresh(s *pool.Store, a *pool.Account) (pool.OAuthData, error) {
 	return od, nil
 }
 
-// usageFor is the one token→usage chain shared by list and auto.
+// usageFor is the one token→usage chain shared by list and auto. It is also the
+// seam where a freshly polled usage is put through the pool's limit policy, so
+// nothing downstream — scoring, exhaustion, the usage cache, the `list` display
+// — sees a model-scoped window the pool opted out of.
 func usageFor(s *pool.Store, a *pool.Account) (pool.Usage, error) {
 	od, err := ensureFresh(s, a)
 	if err != nil {
 		return pool.Usage{}, err
 	}
-	return pool.FetchUsage(od.AccessToken)
+	u, err := pool.FetchUsage(od.AccessToken)
+	if err != nil {
+		return pool.Usage{}, err
+	}
+	if s.IgnoreScopedLimits {
+		u = u.WithoutScoped()
+	}
+	return u, nil
 }
 
 // isOurHelper reports whether an apiKeyHelper value is one we installed —
@@ -790,7 +806,7 @@ func cacheUsages(s *pool.Store, usages []pool.Usage, errs []error) {
 // account is not exhausted or a reset time is unknown.
 func usableAt(u pool.Usage) time.Time {
 	var t time.Time
-	for _, w := range []pool.Window{u.FiveHour, u.SevenDay} {
+	for _, w := range u.Windows() {
 		if w.Pct < 100 {
 			continue
 		}
@@ -903,6 +919,56 @@ func cmdHelper() error {
 	// cc on the network.
 	_ = spawnDetached("auto")
 	return nil
+}
+
+// cmdConfig shows the pool's settings, or sets one. With no arguments it prints
+// every setting; with a setting name alone it prints that one; with a value it
+// persists the change.
+func cmdConfig(args []string) error {
+	if len(args) > 0 && args[0] != "scoped-limits" {
+		return fmt.Errorf("unknown setting %q (known: scoped-limits)", args[0])
+	}
+
+	if len(args) < 2 {
+		s, err := pool.Load()
+		if err != nil {
+			return err
+		}
+		fmt.Printf("scoped-limits  %s\n", onOff(!s.IgnoreScopedLimits))
+		return nil
+	}
+
+	var ignore bool
+	switch args[1] {
+	case "on":
+		ignore = false
+	case "off":
+		ignore = true
+	default:
+		return fmt.Errorf("scoped-limits takes on or off, not %q", args[1])
+	}
+
+	// Under the store lock, since a concurrent auto/helper may be writing the
+	// usage cache in the same file.
+	s, err := pool.LockedUpdate(func(st *pool.Store) error {
+		st.IgnoreScopedLimits = ignore
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("scoped-limits  %s\n", onOff(!s.IgnoreScopedLimits))
+	if ignore {
+		fmt.Println("model-scoped quotas (e.g. Fable) no longer count toward exhaustion; only the 5-hour and 7-day windows do")
+	}
+	return nil
+}
+
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
 }
 
 // cmdStatus prints the active auth profile as JSON from the store alone, no
