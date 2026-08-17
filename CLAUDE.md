@@ -16,6 +16,19 @@ source and the tool decrypts unattended (no passphrase/keychain/biometrics).
 Legacy plaintext files load transparently and are re-written encrypted on the
 next save.
 
+OAuth refresh tokens are **single-use**: a refresh retires the token it sent
+and returns a replacement. Two processes replaying one token read as a stolen
+token and cost the whole grant, permanently. So every `pool.Refresh` call must
+run inside `pool.WithRefreshLock` (per-credential, separate from the store
+lock; order is refresh lock → store lock) and re-read the store inside it, and
+must persist the returned blob. Claude Code rotates the active credential too,
+so anything overwriting the credential store harvests it first. A grant the
+server has permanently rejected is recorded in `Account.AuthError` and left
+alone until re-login, never retried.
+
+Tests must never reach the token endpoint — a refresh there consumes a real
+token. Point `oauthTokenURL` at an `httptest` server instead.
+
 - Source: `cmd/claude-pool` (CLI + hook entry points), `internal/pool` (store,
   oauth, keychain, usage).
 - Build/test: `make build`, `make test` (or `go build ./...` / `go test ./...`).

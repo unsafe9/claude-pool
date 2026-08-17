@@ -77,7 +77,9 @@ account mode ◀──(any account resets)───── API-key mode
 ```
 
 - **Errors are not exhaustion**: an account whose usage poll fails is skipped, not treated as exhausted — and if every poll fails, `auto` stays on the current credential instead of dumping you onto API keys over a network blip.
-- **Self-healing**: every run reconciles the store, settings, and credential store. Hand-deleting the `apiKeyHelper` is respected. A credential that Claude Code itself refreshed is harvested back into the pool (attributed to the right account by email via the profile API). A foreign `apiKeyHelper` you already had is preserved and restored when claude-pool leaves API-key mode.
+- **Token rotation**: refresh tokens are single-use — each refresh retires the token it sent and issues a replacement. Two processes replaying one token would look like a stolen-token reuse and cost you the whole grant, so every refresh runs under a per-credential cross-process lock and re-reads the store inside it, adopting a rotation another process just stored rather than replaying its own. Claude Code rotates the active credential too, so anything about to overwrite the credential store harvests what is there first.
+- **Self-healing**: every run reconciles the store, settings, and credential store. Hand-deleting the `apiKeyHelper` is respected. A credential that Claude Code itself refreshed is harvested back into the pool, attributed to the right account by email via the profile API (renewing it first if it expired in place). A foreign `apiKeyHelper` you already had is preserved and restored when claude-pool leaves API-key mode.
+- **Dead grants**: if the server permanently rejects a stored credential — a refresh token revoked, or retired by a login elsewhere — the account is marked instead of retried, since nothing but a fresh login can repair it. `list` shows it as `re-login required` with the reason; log into Claude Code as that account and re-import it under the same name to clear the mark.
 
 State lives in `~/.config/claude-pool/pool.json` (mode 0600), lock-protected (flock; `LockFileEx` on Windows) against concurrent hook/helper runs. The file is encrypted at rest with machine-bound AES-256-GCM — see [Security](#security).
 
@@ -148,6 +150,7 @@ Source builds report version `dev` and are never replaced by the plugin's self-u
 - On Windows, the first-run bootstrap runs through Git Bash (Claude Code resolves it from your Git for Windows install). Without Git for Windows there is no auto-install and the bootstrap hook reports a one-line error each session start — install the binary once with the PowerShell one-liner above; everything else works.
 - On Linux/WSL/Windows, credentials are a plaintext `~/.claude/.credentials.json` — that is Claude Code's own storage on those platforms; claude-pool reads and writes the same file in the same format (no change to your security posture either way).
 - On macOS, the first Keychain access may pop a permission prompt — choose **Always Allow** to avoid future prompts.
+- The refresh lock covers claude-pool's own processes; Claude Code refreshes the active credential on its own schedule and cannot be locked against. Harvesting keeps the two in sync, but a login to the same account elsewhere still retires the stored token and needs a re-import.
 - Toggling API-key mode rewrites `~/.claude/settings.json`. Symlinks are resolved and preserved, but JSON key order is not.
 - Running multiple consumer subscription accounts may sit against Anthropic's consumer terms of service. Use at your own risk.
 

@@ -12,6 +12,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"math"
@@ -115,17 +116,18 @@ Add accounts: log into cc with each account, then run `+"`import --id NAME`"+` e
 `)
 }
 
-// newFlagSet uses ContinueOnError so a bad flag exits 1 via main's error path
-// — flag.ExitOnError would os.Exit(2), which cc hooks interpret as a blocking
-// error (UserPromptSubmit would erase the prompt).
+// ContinueOnError routes a bad flag through main's exit-1 path; ExitOnError
+// would os.Exit(2), which cc reads as a blocking hook error.
 func newFlagSet(name string) *flag.FlagSet {
 	return flag.NewFlagSet(name, flag.ContinueOnError)
 }
 
-// ensureFresh refreshes a's token if it is expiring, persisting the rotated
-// credential to the store under lock and — when a is the live account — to the
-// Keychain, so cc is never left holding a refresh token we just consumed.
-func ensureFresh(s *pool.Store, a *pool.Account) (pool.OAuthData, error) {
+// ensureFresh returns a's OAuth data with a live access token, refreshing and
+// persisting it when it is expiring. It updates a.Blob in place.
+func ensureFresh(a *pool.Account) (pool.OAuthData, error) {
+	if a.Revoked() {
+		return pool.OAuthData{}, reloginError(a.ID, a.AuthError)
+	}
 	od, err := pool.ParseBlob(a.Blob)
 	if err != nil {
 		return pool.OAuthData{}, fmt.Errorf("account %q: %w", a.ID, err)
@@ -133,44 +135,91 @@ func ensureFresh(s *pool.Store, a *pool.Account) (pool.OAuthData, error) {
 	if !pool.IsExpired(od.ExpiresAt) {
 		return od, nil
 	}
-	nb, changed, err := pool.Refresh(a.Blob)
+
+	load := func() (string, error) { return storedBlob(a) }
+	save := func(nb string) error { return persistRotation(a, nb) }
+	blob, err := pool.RefreshCredential(a.ID, load, save)
 	if err != nil {
-		return od, fmt.Errorf("account %q refresh: %w", a.ID, err)
+		if errors.Is(err, errRelogin) {
+			return pool.OAuthData{}, err
+		}
+		markAuthError(a, err)
+		return pool.OAuthData{}, fmt.Errorf("account %q refresh: %w", a.ID, err)
 	}
-	if !changed {
-		return od, nil
+	a.Blob = blob
+	return pool.ParseBlob(blob)
+}
+
+// storedBlob re-reads a's credential from disk, so a rotation another process
+// stored while we waited for the lock wins over the snapshot in hand.
+func storedBlob(a *pool.Account) (string, error) {
+	cur, err := pool.Load()
+	if err != nil {
+		return a.Blob, nil
 	}
-	a.Blob = nb
-	if _, err := pool.LockedUpdate(func(st *pool.Store) error {
+	e := cur.Find(a.ID)
+	if e == nil {
+		return a.Blob, nil
+	}
+	if e.Revoked() {
+		a.AuthError = e.AuthError
+		return "", reloginError(a.ID, e.AuthError)
+	}
+	return e.Blob, nil
+}
+
+// persistRotation saves a rotated credential, and mirrors it to the Keychain
+// when a is the live account.
+func persistRotation(a *pool.Account, nb string) error {
+	_, err := pool.LockedUpdate(func(st *pool.Store) error {
 		if e := st.Find(a.ID); e != nil {
 			e.Blob = nb
+			e.AuthError = ""
 		}
-		// Persist the rotated blob and update the Keychain under the same lock
-		// so a concurrent auto/helper can't desync them. Guard on the freshly
-		// loaded st.Current (not the stale snapshot) so we don't clobber a swap
-		// another process just made. The Keychain write is best-effort: the
-		// rotated refresh token MUST still be saved even if it fails, or the
-		// next refresh would reuse a token the server may already have rotated
-		// out — a deferred Keychain write is reconciled by the next auto/harvest.
+		// Guarding on the freshly loaded st.Current lets a swap another process
+		// just made survive. The Keychain write is best-effort: the rotated
+		// token must be saved even if it fails, or the next refresh reuses a
+		// retired one — the next harvest reconciles the deferred write.
 		if st.Mode != pool.ModeAPIKey && a.ID == st.Current {
 			if werr := pool.WriteCredential(nb); werr != nil {
 				fmt.Fprintln(os.Stderr, "claude-pool: credential store update deferred:", werr)
 			}
 		}
 		return nil
-	}); err != nil {
-		return od, err
-	}
-	od, _ = pool.ParseBlob(nb)
-	return od, nil
+	})
+	return err
 }
 
-// usageFor is the one token→usage chain shared by list and auto. It is also the
-// seam where a freshly polled usage is put through the pool's limit policy, so
-// nothing downstream — scoring, exhaustion, the usage cache, the `list` display
-// — sees a model-scoped window the pool opted out of.
+// errRelogin marks the errors that only a fresh login can clear, so callers can
+// tell them apart from a refresh that merely failed.
+var errRelogin = errors.New("needs re-login")
+
+func reloginError(id, cause string) error {
+	return fmt.Errorf("account %q %w: %s", id, errRelogin, cause)
+}
+
+// markAuthError records a permanently dead grant so the pool stops replaying a
+// token the server will never accept again. Transient failures (network, 5xx, a
+// client-level fault) are deliberately not recorded, so they keep retrying.
+func markAuthError(a *pool.Account, err error) {
+	var re *pool.RefreshError
+	if !errors.As(err, &re) || !re.Revoked() {
+		return
+	}
+	a.AuthError = re.Error()
+	_, _ = pool.LockedUpdate(func(st *pool.Store) error {
+		if e := st.Find(a.ID); e != nil {
+			e.AuthError = a.AuthError
+		}
+		return nil
+	})
+}
+
+// usageFor is the one token→usage chain shared by list and auto, and the single
+// seam applying the pool's limit policy — so nothing downstream ever sees a
+// model-scoped window the pool opted out of.
 func usageFor(s *pool.Store, a *pool.Account) (pool.Usage, error) {
-	od, err := ensureFresh(s, a)
+	od, err := ensureFresh(a)
 	if err != nil {
 		return pool.Usage{}, err
 	}
@@ -219,7 +268,6 @@ func reconcile(s *pool.Store) error {
 	return nil
 }
 
-// demote drops the store back to account mode and clears the saved helper.
 func demote(s *pool.Store) error {
 	return s.Update(func(st *pool.Store) error {
 		if st.Mode == pool.ModeAPIKey {
@@ -230,25 +278,52 @@ func demote(s *pool.Store) error {
 	})
 }
 
-// harvest folds a Keychain credential that cc itself refreshed (or a manual
-// /login into a known account) back into the pool before any decision
-// overwrites it with a stale stored blob. Attribution is by account email via
-// the profile API; an unattributable credential is left untouched.
+// loadPool is how every command that touches credentials loads the store.
+// Claude Code rotates the active credential in place, and that rotation retires
+// the refresh token the pool holds — so folding it back before anything reads
+// or overwrites a stored blob is what keeps accounts off dead grants. Doing it
+// here means no caller has to remember to.
+func loadPool() (*pool.Store, error) {
+	s, err := pool.Load()
+	if err != nil {
+		return nil, err
+	}
+	harvest(s)
+	return s, nil
+}
+
+// harvest folds a credential that cc itself refreshed (or a manual /login into
+// a known account) back into the pool.
+//
+// Attribution is by account email via the profile API, which needs a live access
+// token; a credential that expired in place is refreshed first. An
+// unattributable one is left untouched rather than guessed at, since
+// misattributing it would overwrite one account's credential with another's.
 func harvest(s *pool.Store) {
+	if len(s.Accounts) == 0 {
+		return
+	}
 	kc, err := pool.ReadCredential()
 	if err != nil || kc == "" {
 		return
 	}
+	// Patch s in place rather than via Store.Update, which would swap in a fresh
+	// disk load and detach every *Account the caller is holding.
 	adopt := func(a *pool.Account) {
-		_ = s.Update(func(st *pool.Store) error {
+		_, _ = pool.LockedUpdate(func(st *pool.Store) error {
 			if e := st.Find(a.ID); e != nil {
 				e.Blob = kc
+				e.AuthError = "" // a working credential supersedes a dead grant
 			}
 			if st.Mode != pool.ModeAPIKey {
 				st.Current = a.ID
 			}
 			return nil
 		})
+		a.Blob, a.AuthError = kc, ""
+		if s.Mode != pool.ModeAPIKey {
+			s.Current = a.ID
+		}
 	}
 	for _, a := range s.Accounts {
 		if a.Blob == kc {
@@ -262,6 +337,15 @@ func harvest(s *pool.Store) {
 	if err != nil {
 		return
 	}
+	if pool.IsExpired(od.ExpiresAt) {
+		if kc, err = refreshCredentialStore(kc); err != nil {
+			fmt.Fprintln(os.Stderr, "claude-pool: could not identify the active credential:", err)
+			return
+		}
+		if od, err = pool.ParseBlob(kc); err != nil {
+			return
+		}
+	}
 	email, err := pool.FetchProfile(od.AccessToken)
 	if err != nil || email == "" {
 		return
@@ -272,6 +356,20 @@ func harvest(s *pool.Store) {
 			return
 		}
 	}
+}
+
+// refreshCredentialStore renews cc's own credential when it has expired in
+// place, so harvest can identify it. The rotation goes straight back to the
+// credential store: the refresh retired the token cc was holding, and leaving
+// the old blob there would strand cc on a dead grant. Nothing can lock against
+// cc itself, but this serializes claude-pool's own processes.
+func refreshCredentialStore(blob string) (string, error) {
+	return pool.RefreshCredential(pool.CredentialStoreLockID, func() (string, error) {
+		if cur, err := pool.ReadCredential(); err == nil && cur != "" {
+			return cur, nil
+		}
+		return blob, nil
+	}, pool.WriteCredential)
 }
 
 func cmdImport(args []string) error {
@@ -308,8 +406,8 @@ func cmdImport(args []string) error {
 	if err != nil {
 		return err
 	}
-	// The just-logged-in account is what the user wants active — this also
-	// leaves apikey mode if we were in it.
+	// The just-logged-in account is what the user wants active; this also leaves
+	// apikey mode.
 	if err := useAccount(s, s.Find(name)); err != nil {
 		return err
 	}
@@ -317,10 +415,10 @@ func cmdImport(args []string) error {
 	return nil
 }
 
-// autoAccountID names an account imported without --id: the email local-part
-// when available (so re-importing the same account refreshes the same entry),
-// falling back to a timestamp. A local-part claimed by a DIFFERENT account
-// gets a timestamp suffix instead of silently overwriting it.
+// autoAccountID names an account imported without --id. The email local-part
+// makes re-importing the same account refresh its existing entry; a local-part
+// already claimed by a different account gets a timestamp suffix instead of
+// silently overwriting it.
 func autoAccountID(st *pool.Store, email string) string {
 	ts := time.Now().Format("20060102-150405")
 	if email == "" {
@@ -419,9 +517,9 @@ func cmdRemove(args []string) error {
 		fmt.Fprintln(os.Stderr, "claude-pool: left API key mode (last key removed); cc will use the stored account credential")
 	}
 	if wasActiveAccount {
-		// The removed account still owns the live Keychain blob. Switch to a
-		// remaining account so cc stops authenticating as the removed one. If
-		// none remain, there is nothing to switch to.
+		// The removed account still owns the live Keychain blob, so cc would go
+		// on authenticating as it. pool.Load, not loadPool: that blob belongs to
+		// the account just deleted, so there is nothing left to harvest it into.
 		s, err := pool.Load()
 		if err != nil {
 			return err
@@ -445,12 +543,13 @@ func cmdList(args []string) error {
 		return err
 	}
 
-	s, err := pool.Load()
-	if err != nil {
-		return err
-	}
-
 	if *asJSON {
+		// Deliberately pool.Load, not loadPool: --json is documented as
+		// network-free, and harvesting reads the credential store.
+		s, err := pool.Load()
+		if err != nil {
+			return err
+		}
 		type entry struct {
 			ID    string `json:"id"`
 			Email string `json:"email,omitempty"`
@@ -480,6 +579,10 @@ func cmdList(args []string) error {
 		return json.NewEncoder(os.Stdout).Encode(out)
 	}
 
+	s, err := loadPool()
+	if err != nil {
+		return err
+	}
 	if len(s.Accounts) == 0 && len(s.APIKeys) == 0 {
 		fmt.Println("empty pool; run `claude-pool import --id NAME` and/or `claude-pool key add --id NAME`")
 		return nil
@@ -487,16 +590,22 @@ func cmdList(args []string) error {
 	now := time.Now()
 	usages, errs := pollAccounts(s, nil)
 	cacheUsages(s, usages, errs)
+	var needLogin []string
 	for i, a := range s.Accounts {
 		marker := "  "
 		if a.ID == s.Current && s.Mode != pool.ModeAPIKey {
 			marker = "* "
 		}
-		if errs[i] != nil {
+		switch {
+		// A dead grant is a standing state, not a failed poll.
+		case a.AuthError != "":
+			needLogin = append(needLogin, a.ID)
+			fmt.Printf("%s%-16s  re-login required (%s)\n", marker, a.ID, a.AuthError)
+		case errs[i] != nil:
 			fmt.Printf("%s%-16s  (error: %v)\n", marker, a.ID, errs[i])
-			continue
+		default:
+			fmt.Printf("%s%-16s  %s\n", marker, a.ID, usages[i].FormatStatusline(now))
 		}
-		fmt.Printf("%s%-16s  %s\n", marker, a.ID, usages[i].FormatStatusline(now))
 	}
 	for _, k := range s.APIKeys {
 		marker := "  "
@@ -504,6 +613,12 @@ func cmdList(args []string) error {
 			marker = "* "
 		}
 		fmt.Printf("%skey:%-12s  %s\n", marker, k.ID, maskKey(k.Key))
+	}
+	if len(needLogin) > 0 {
+		fmt.Fprintf(os.Stderr, "\nTo repair: log into Claude Code as the account, then re-import it under the same name:\n")
+		for _, id := range needLogin {
+			fmt.Fprintf(os.Stderr, "  claude /login   # as %s\n  claude-pool import --id %s\n", id, id)
+		}
 	}
 	return nil
 }
@@ -513,7 +628,7 @@ func cmdSwitch(args []string) error {
 		return fmt.Errorf("usage: claude-pool switch <id>")
 	}
 	id := args[0]
-	s, err := pool.Load()
+	s, err := loadPool()
 	if err != nil {
 		return err
 	}
@@ -521,7 +636,7 @@ func cmdSwitch(args []string) error {
 	if a == nil {
 		return fmt.Errorf("no account %q (see `claude-pool list`)", id)
 	}
-	if _, err := ensureFresh(s, a); err != nil {
+	if _, err := ensureFresh(a); err != nil {
 		return err
 	}
 	if err := useAccount(s, a); err != nil {
@@ -542,7 +657,7 @@ func cmdAuto(args []string) error {
 	}
 	ccArgs := fs.Args()
 
-	s, err := pool.Load()
+	s, err := loadPool()
 	if err != nil {
 		return err
 	}
@@ -576,18 +691,15 @@ func cmdAuto(args []string) error {
 		return finish(nil)
 	}
 
-	harvest(s)
-
-	// Single account with no keys: nothing to switch between (harvest above
-	// still keeps the stored blob in sync with cc's).
+	// Single account with no keys: nothing to switch between, though loadPool's
+	// harvest still keeps the stored blob in sync with cc's.
 	if len(s.Accounts) == 1 && len(s.APIKeys) == 0 {
 		return finish(nil)
 	}
 
-	// --if-needed fast path (the per-prompt hook case): in account mode, if
-	// the current account is still under the threshold, poll only it and stay
-	// put. In apikey mode there is no fast path — returning to an account the
-	// moment one resets requires polling them all.
+	// --if-needed fast path (the per-prompt hook): poll only the current account
+	// and stay put while it is under threshold. apikey mode gets no fast path —
+	// returning to an account the moment one resets requires polling them all.
 	var curUsage *pool.Usage
 	if *ifNeeded && s.Mode != pool.ModeAPIKey {
 		if cur := s.Find(s.Current); cur != nil {
@@ -600,13 +712,10 @@ func cmdAuto(args []string) error {
 		}
 	}
 
-	// While in API-key mode the accounts aren't being used, so their utilization
-	// can't change until a window resets. If every account is provably still
-	// exhausted (cached and not yet past its reset), there is nothing to recover
-	// yet — skip the poll entirely. Re-poll only once some reset has passed.
-	// This is sound ONLY in apikey mode; in account mode the current account IS
-	// being used, so its utilization rises over time — hence the fast path above
-	// keeps polling it.
+	// Idle accounts can't recover before a window resets, so a cache that still
+	// proves exhaustion makes the poll pointless. Sound ONLY in apikey mode: in
+	// account mode the current account is in use and its utilization rises,
+	// which is why the fast path above keeps polling it.
 	if s.Mode == pool.ModeAPIKey {
 		allStillExhausted := true
 		for _, a := range s.Accounts {
@@ -620,12 +729,20 @@ func cmdAuto(args []string) error {
 		}
 	}
 
-	// Full pass: poll every account concurrently, reusing the fast-path poll.
 	usages, errs := pollAccounts(s, curUsage)
 	cacheUsages(s, usages, errs)
 	best, bestScore, polled := bestAccount(s, usages, errs)
 
 	switch {
+	// A standing verdict, unlike an unreachable poll: the accounts will never
+	// recover on their own, so keys are the only auth left.
+	case allAuthFailed(s):
+		fmt.Fprintln(os.Stderr, "claude-pool: every account needs re-login (see `claude-pool list`)")
+		if len(s.APIKeys) > 0 && s.Mode != pool.ModeAPIKey {
+			return finish(enterAPIKeyMode(s))
+		}
+		return finish(nil)
+
 	// Zero information: a network blip must not be mistaken for exhaustion —
 	// stay on whatever credential cc already has.
 	case polled == 0:
@@ -648,7 +765,6 @@ func cmdAuto(args []string) error {
 		}
 		return finish(nil)
 
-	// Every polled account exhausted → API key fallback, if any are registered.
 	case len(s.APIKeys) > 0:
 		if s.Mode != pool.ModeAPIKey {
 			fmt.Fprintln(os.Stderr, "claude-pool: every account is exhausted")
@@ -692,7 +808,20 @@ func pollAccounts(s *pool.Store, cur *pool.Usage) ([]pool.Usage, []error) {
 	return usages, errs
 }
 
-// bestAccount picks the successfully polled account with the most headroom.
+// allAuthFailed reports whether every account needs a fresh login. An empty
+// pool is not "all revoked" — callers read this as a standing verdict.
+func allAuthFailed(s *pool.Store) bool {
+	if len(s.Accounts) == 0 {
+		return false
+	}
+	for _, a := range s.Accounts {
+		if !a.Revoked() {
+			return false
+		}
+	}
+	return true
+}
+
 func bestAccount(s *pool.Store, usages []pool.Usage, errs []error) (best *pool.Account, bestScore float64, polled int) {
 	bestScore = math.Inf(1)
 	for i, a := range s.Accounts {
@@ -707,11 +836,10 @@ func bestAccount(s *pool.Store, usages []pool.Usage, errs []error) (best *pool.A
 	return best, bestScore, polled
 }
 
-// scheduleRecoveryWake spawns a detached one-shot that re-runs `auto` just
-// after the earliest moment an exhausted account becomes usable again, so
-// leaving API-key mode does not wait for the next hook firing. Best-effort:
-// skipped when no reset time is known, capped so multi-day (7d-bound) resets
-// are left to the hooks and the helper's recovery probe.
+// scheduleRecoveryWake re-runs `auto` just after the earliest exhausted account
+// becomes usable, so leaving API-key mode does not wait for the next hook.
+// Best-effort: skipped when no reset time is known, and capped so multi-day
+// (7d-bound) resets fall to the hooks and the helper's recovery probe.
 func scheduleRecoveryWake(usages []pool.Usage, errs []error) {
 	now := time.Now()
 	var soonest time.Time
@@ -743,9 +871,8 @@ func scheduleRecoveryWake(usages []pool.Usage, errs []error) {
 	if pool.PendingWakeBefore(target) {
 		return
 	}
-	// Spawn a detached `__wake N` that sleeps then re-runs auto. This is the
-	// portable replacement for the unix-only `/bin/sh -c "sleep N; exec <exe>
-	// auto"`, working on Windows too.
+	// `__wake N` sleeps then re-runs auto, in-binary so this works on Windows
+	// too.
 	if err := spawnDetached("__wake", strconv.Itoa(int(delay.Seconds()))); err != nil {
 		return
 	}
@@ -766,9 +893,8 @@ func spawnDetached(args ...string) error {
 }
 
 // stillExhausted reports whether a's cached usage PROVES it is still exhausted
-// at now — i.e. we have a cached usage, it pins down a reset time, and now has
-// not reached it yet. A cache miss (nil Usage) or an unknown reset (usableAt
-// returns zero) yields false, so the caller falls back to polling.
+// at now. A cache miss or an unknown reset yields false, so the caller falls
+// back to polling rather than assuming.
 func stillExhausted(a *pool.Account, now time.Time) bool {
 	if a.Usage == nil {
 		return false
@@ -777,14 +903,11 @@ func stillExhausted(a *pool.Account, now time.Time) bool {
 	return !t.IsZero() && now.Before(t)
 }
 
-// cacheUsages persists each successfully-polled account's usage into the store,
-// keyed by ID. usages/errs are indexed parallel to s.Accounts (pollAccounts'
-// alignment). It persists via LockedUpdate WITHOUT writing back into the
-// caller's s: s.Update would replace s.Accounts with a fresh disk load (a
-// possibly different length if another process added/removed an account), which
-// would leave the subsequent bestAccount / list print loop indexing usages/errs
-// out of range. The current pass already holds the live results; only future
-// processes read the cache. Call on the main goroutine, after pollAccounts joins.
+// cacheUsages persists each successfully-polled usage, keyed by ID. usages/errs
+// stay indexed parallel to s.Accounts, which is why this uses LockedUpdate and
+// never s.Update: a fresh disk load could change the slice's length and leave
+// the caller's print/scoring loop indexing out of range. Only future processes
+// read the cache. Call on the main goroutine, after pollAccounts joins.
 func cacheUsages(s *pool.Store, usages []pool.Usage, errs []error) {
 	now := time.Now()
 	_, _ = pool.LockedUpdate(func(st *pool.Store) error {
@@ -822,7 +945,8 @@ func usableAt(u pool.Usage) time.Time {
 
 // useAccount makes a the active credential, reconciling against what the
 // Keychain actually holds rather than trusting the stored Current pointer, and
-// leaves apikey mode (restoring any displaced foreign apiKeyHelper).
+// leaves apikey mode (restoring any displaced foreign apiKeyHelper). The store
+// must already be harvested — see loadPool.
 func useAccount(s *pool.Store, a *pool.Account) error {
 	kc, kcErr := pool.ReadCredential()
 	if s.Mode == pool.ModeAPIKey {
@@ -909,21 +1033,15 @@ func cmdHelper() error {
 	}); err != nil {
 		return err
 	}
-	// Serve the key first: cc waits for THIS process to exit, so any recovery
-	// work must not block here (a full poll can take ~16s and exceed cc's
-	// helper timeout). stdout is unbuffered, so this flushes to cc now.
+	// Serve the key first: cc waits for THIS process to exit, and a full poll
+	// would exceed its helper timeout.
 	fmt.Println(key)
-	// Cost guard: cc calls the helper exactly when it is about to spend on an
-	// API key. Hand the recovery decision to a detached `auto`, which already
-	// leaves apikey mode the moment an account has headroom — without blocking
-	// cc on the network.
+	// cc calls the helper exactly when it is about to spend on a key, so this is
+	// the moment to try recovering — detached, off cc's critical path.
 	_ = spawnDetached("auto")
 	return nil
 }
 
-// cmdConfig shows the pool's settings, or sets one. With no arguments it prints
-// every setting; with a setting name alone it prints that one; with a value it
-// persists the change.
 func cmdConfig(args []string) error {
 	if len(args) > 0 && args[0] != "scoped-limits" {
 		return fmt.Errorf("unknown setting %q (known: scoped-limits)", args[0])
@@ -972,11 +1090,9 @@ func onOff(b bool) string {
 }
 
 // cmdStatus prints the active auth profile as JSON from the store alone, no
-// network — cheap enough for a statusline script to call on every render. In
-// API-key mode it adds the soonest moment an account is expected to free up
-// (the soonest cached window reset), so a statusline can show "back to
-// subscription in 40m". That reset is read from the usage cache `auto` persists;
-// when no usable reset is known (cold cache) the reset fields are omitted.
+// network — cheap enough for a statusline to call on every render. In API-key
+// mode it adds the soonest cached window reset so a statusline can show "back
+// to subscription in 40m"; a cold cache omits the reset fields.
 func cmdStatus() error {
 	s, err := pool.Load()
 	if err != nil {
@@ -1038,4 +1154,3 @@ func warnRunning() {
 				"(mid-session pickup is not guaranteed)\n", len(pids))
 	}
 }
-

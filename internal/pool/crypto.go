@@ -9,40 +9,36 @@ import (
 	"errors"
 	"os"
 	"os/user"
+	"sync"
 )
 
 // pool.json is encrypted at rest with machine-bound AES-256-GCM. The threat
-// model is narrow and honest: this defeats credential scanners (info-stealers
-// grepping for sk-ant-, JWTs, JSON key names) and accidental plaintext leaks
-// (git commits, screenshots, backups), and makes one machine's ciphertext
-// non-portable. It is NOT protection against a targeted local attacker — the
-// key-derivation code is open source and the tool must decrypt unattended, so
-// anyone who can run it on this machine can recover the keys. No passphrase,
-// no OS keychain, no biometrics.
+// model is narrow and worth stating honestly: this defeats credential scanners
+// and accidental plaintext leaks (git, screenshots, backups), and makes one
+// machine's ciphertext non-portable. It is NOT protection against a targeted
+// local attacker — the derivation is open source and the tool decrypts
+// unattended, so anyone who can run it here can recover the keys.
 
-// storeMagic prefixes every encrypted blob. Load uses it to tell ciphertext
-// from legacy plaintext JSON (which starts with '{').
+// storeMagic tells ciphertext from legacy plaintext JSON, which starts with '{'.
 var storeMagic = []byte("CPL1")
 
 const storeNonceSize = 12 // AES-GCM standard nonce
 
-// appSalt is a fixed application salt for HKDF. It is not secret.
-var appSalt = []byte("claude-pool/store-salt/v1")
+var appSalt = []byte("claude-pool/store-salt/v1") // fixed, not secret
 
 // keyInfo binds the derived key to this purpose and format version.
 const keyInfo = "claude-pool-store-v1"
 
-// fallbackMachineID stands in when the OS machine id cannot be read. Encryption
-// must always happen (plaintext-avoidance is the priority), so we still derive a
-// key — this just weakens the machine-binding for that one machine.
+// fallbackMachineID keeps encryption working when the OS machine id is
+// unreadable, at the cost of machine-binding on that one machine — never worth
+// falling back to plaintext for.
 const fallbackMachineID = "claude-pool/no-machine-id"
 
-// machineID returns a stable per-machine identifier (see crypto_*.go for the
-// platform sources). It is a var so tests can inject a deterministic value.
+// A var so tests can inject a deterministic value.
 var machineID = readMachineID
 
-// currentUsername mirrors keychainAccount's resolution (user.Current with $USER
-// fallback) so the derived key is stable across the same user's invocations.
+// currentUsername mirrors keychainAccount's resolution so the derived key stays
+// stable across the same user's invocations.
 func currentUsername() string {
 	if u, err := user.Current(); err == nil && u.Username != "" {
 		return u.Username
@@ -53,9 +49,7 @@ func currentUsername() string {
 	return "user"
 }
 
-// deriveKey returns a 32-byte AES-256 key bound to this machine and user via
-// HKDF-SHA256. A failed machine-id lookup degrades to the fallback rather than
-// erroring, so encryption never silently falls back to plaintext.
+// deriveKey binds the key to this machine and user via HKDF-SHA256.
 func deriveKey() ([]byte, error) {
 	id := machineID()
 	if id == "" {
@@ -65,7 +59,20 @@ func deriveKey() ([]byte, error) {
 	return hkdf.Key(sha256.New, secret, appSalt, keyInfo, 32)
 }
 
+var (
+	aeadMu    sync.Mutex
+	aeadCache cipher.AEAD
+)
+
+// gcm caches the AEAD because deriving the key shells out for the machine id
+// (`ioreg` on macOS, ~30ms), and a single `auto` run loads or saves the store
+// a dozen times — enough to eat a noticeable slice of the hook's budget.
 func gcm() (cipher.AEAD, error) {
+	aeadMu.Lock()
+	defer aeadMu.Unlock()
+	if aeadCache != nil {
+		return aeadCache, nil
+	}
 	key, err := deriveKey()
 	if err != nil {
 		return nil, err
@@ -74,7 +81,20 @@ func gcm() (cipher.AEAD, error) {
 	if err != nil {
 		return nil, err
 	}
-	return cipher.NewGCM(block)
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, err
+	}
+	aeadCache = aead
+	return aead, nil
+}
+
+// resetKeyCache drops the cached AEAD; tests that swap the machine id use it to
+// force re-derivation.
+func resetKeyCache() {
+	aeadMu.Lock()
+	defer aeadMu.Unlock()
+	aeadCache = nil
 }
 
 // encrypt seals plaintext as magic(4) + nonce(12) + GCM ciphertext-with-tag.
@@ -93,8 +113,8 @@ func encrypt(plaintext []byte) ([]byte, error) {
 	return aead.Seal(out, nonce, plaintext, nil), nil
 }
 
-// decrypt reverses encrypt. It errors on a bad magic, a short blob, or a failed
-// authentication (tampered ciphertext, or a key derived on a different machine).
+// decrypt reverses encrypt. Authentication failure means tampering — or, far
+// more often, a key derived on a different machine or under a different user.
 func decrypt(data []byte) ([]byte, error) {
 	if len(data) < len(storeMagic)+storeNonceSize {
 		return nil, errors.New("pool: ciphertext too short")

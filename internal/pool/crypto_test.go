@@ -13,7 +13,8 @@ func withMachineID(t *testing.T, id string) {
 	t.Helper()
 	prev := machineID
 	machineID = func() string { return id }
-	t.Cleanup(func() { machineID = prev })
+	resetKeyCache()
+	t.Cleanup(func() { machineID = prev; resetKeyCache() })
 }
 
 func TestCrypto_RoundTrip(t *testing.T) {

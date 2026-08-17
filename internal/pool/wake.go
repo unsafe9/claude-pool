@@ -6,20 +6,19 @@ import (
 	"time"
 )
 
-// wakePath is the marker file recording the next scheduled recovery wake, kept
-// next to the store so overlapping apikey entries can dedup their wakers.
+// wakePath is the marker file recording the next scheduled recovery wake, so
+// overlapping apikey entries can dedup their wakers.
 func wakePath() (string, error) {
-	sp, err := StorePath()
+	dir, err := configDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(filepath.Dir(sp), "wake"), nil
+	return filepath.Join(dir, "wake"), nil
 }
 
-// PendingWakeBefore reports whether a recovery wake is already recorded at or
-// before t — i.e. an existing waker will fire no later than the new target, so
-// scheduling another is redundant. Best-effort: any error reports false (no
-// dedup) so a wake still gets scheduled.
+// PendingWakeBefore reports whether an existing waker will fire no later than
+// t, making another redundant. Best-effort: any error reports false, so a wake
+// still gets scheduled.
 func PendingWakeBefore(t time.Time) bool {
 	p, err := wakePath()
 	if err != nil {

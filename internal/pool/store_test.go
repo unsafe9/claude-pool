@@ -2,18 +2,13 @@ package pool
 
 import (
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 )
 
 func TestStore_RoundTripAndUpsert(t *testing.T) {
 	withMachineID(t, "test-machine-id")
-	dir := t.TempDir()
-	path := filepath.Join(dir, "accounts.json")
-	prev := StorePath
-	StorePath = func() (string, error) { return path, nil }
-	t.Cleanup(func() { StorePath = prev })
+	path := withStorePath(t)
 
 	s := &Store{path: path}
 	s.Upsert(&Account{ID: "alice", Blob: `{"claudeAiOauth":{"accessToken":"a"}}`})
@@ -49,6 +44,17 @@ func TestStore_RoundTripAndUpsert(t *testing.T) {
 	}
 	if got := s2.Find("alice").Blob; got != `{"claudeAiOauth":{"accessToken":"a2"}}` {
 		t.Errorf("Upsert did not replace blob: %s", got)
+	}
+}
+
+// Re-importing is the cure for a revoked grant, so a replaced blob has to clear
+// the verdict recorded against the old one.
+func TestStore_UpsertClearsAuthError(t *testing.T) {
+	s := &Store{}
+	s.Upsert(&Account{ID: "alice", Blob: "old", AuthError: "token refresh: HTTP 400 invalid_grant"})
+	s.Upsert(&Account{ID: "alice", Blob: "new"})
+	if got := s.Find("alice").AuthError; got != "" {
+		t.Errorf("AuthError = %q, want cleared", got)
 	}
 }
 
@@ -93,11 +99,7 @@ func TestStore_APIKeysAndRemove(t *testing.T) {
 // window would otherwise pin the pool to billed keys until its multi-day reset.
 func TestLoad_IgnoreScopedLimitsStripsCachedUsage(t *testing.T) {
 	withMachineID(t, "test-machine-id")
-	dir := t.TempDir()
-	path := filepath.Join(dir, "pool.json")
-	prev := StorePath
-	StorePath = func() (string, error) { return path, nil }
-	t.Cleanup(func() { StorePath = prev })
+	path := withStorePath(t)
 
 	exhausted := Usage{
 		FiveHour: Window{Pct: 20},

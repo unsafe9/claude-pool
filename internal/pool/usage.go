@@ -75,14 +75,11 @@ func FetchUsage(accessToken string) (Usage, error) {
 	return parseUsage(resp.Body)
 }
 
-// parseUsage decodes a /api/oauth/usage body.
-//
-// The account-wide windows come from the legacy top-level five_hour/seven_day
-// objects; the model-scoped windows come from the newer `limits` array, whose
-// scoped entries carry the model under scope.model.display_name. The array's
-// unscoped entries (kind "session"/"weekly_all") restate the top-level windows
-// and are skipped. Per-model top-level fields (seven_day_opus and friends) are
-// no longer populated and are ignored.
+// parseUsage decodes a /api/oauth/usage body, which reports the same state two
+// ways: account-wide windows in the top-level five_hour/seven_day objects, and
+// model-scoped ones in the newer `limits` array under scope.model.display_name.
+// The array's unscoped entries only restate the top-level windows, and the
+// per-model top-level fields are no longer populated; both are skipped.
 func parseUsage(r io.Reader) (Usage, error) {
 	var raw struct {
 		FiveHour *rawWindow `json:"five_hour"`

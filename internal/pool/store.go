@@ -19,9 +19,19 @@ type Account struct {
 	Email string `json:"email,omitempty"`
 	Blob  string `json:"blob"`
 
+	// AuthError records why the server permanently rejected this credential —
+	// a refresh token it has retired or revoked. Non-empty means retrying
+	// cannot help; adopting a working credential (import, or harvesting a
+	// cc-side login) clears it.
+	AuthError string `json:"auth_error,omitempty"`
+
 	Usage   *Usage    `json:"usage,omitempty"`    // last polled usage (cache)
 	UsageAt time.Time `json:"usage_at,omitempty"` // when Usage was fetched
 }
+
+// Revoked reports whether the server has permanently rejected this account's
+// credential, so only a fresh login can revive it.
+func (a *Account) Revoked() bool { return a.AuthError != "" }
 
 // APIKey is one stored Anthropic API key, used only after every subscription
 // account is exhausted.
@@ -38,20 +48,19 @@ const (
 	ModeAPIKey  = "apikey"
 )
 
-// Store is the on-disk pool. Current records the account ID last written to
-// the Keychain. CurrentKey and KeyCursor track the round-robin position over
-// APIKeys while in apikey mode. SavedHelper preserves a foreign apiKeyHelper
-// value we displaced on entering apikey mode, so leaving restores it.
-//
-// IgnoreScopedLimits opts out of model-scoped rate-limit windows (Fable's own
-// weekly quota, say), so only the account-wide 5-hour and 7-day windows decide
-// exhaustion. The zero value keeps them in force.
+// Store is the on-disk pool.
 type Store struct {
-	Mode               string     `json:"mode,omitempty"`
-	Current            string     `json:"current,omitempty"`
-	CurrentKey         string     `json:"current_key,omitempty"`
-	KeyCursor          int        `json:"key_cursor,omitempty"`
-	SavedHelper        string     `json:"saved_api_key_helper,omitempty"`
+	Mode string `json:"mode,omitempty"`
+	// Current is the account ID last written to the Keychain.
+	Current string `json:"current,omitempty"`
+	// CurrentKey and KeyCursor hold the round-robin position over APIKeys.
+	CurrentKey string `json:"current_key,omitempty"`
+	KeyCursor  int    `json:"key_cursor,omitempty"`
+	// SavedHelper preserves a foreign apiKeyHelper displaced on entering apikey
+	// mode, so leaving restores it.
+	SavedHelper string `json:"saved_api_key_helper,omitempty"`
+	// IgnoreScopedLimits opts out of model-scoped windows (Fable's own weekly
+	// quota, say), leaving exhaustion to the account-wide 5h and 7d windows.
 	IgnoreScopedLimits bool       `json:"ignore_scoped_limits,omitempty"`
 	Accounts           []*Account `json:"accounts"`
 	APIKeys            []*APIKey  `json:"api_keys,omitempty"`
@@ -68,10 +77,19 @@ var StorePath = func() (string, error) {
 	return filepath.Join(home, ".config", "claude-pool", "pool.json"), nil
 }
 
+// configDir is where the store and its sidecars (locks, the wake marker) live,
+// so a test that redirects StorePath moves all of them together.
+func configDir() (string, error) {
+	path, err := StorePath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Dir(path), nil
+}
+
 // Load reads the store, returning an empty store if the file does not exist yet.
-// On-disk it is machine-bound AES-256-GCM (see crypto.go); a legacy plaintext
-// JSON file (starting with '{') is still read, and the next Save re-writes it
-// encrypted, so plaintext disappears on first write.
+// A legacy plaintext file (starting with '{') still reads, and the next Save
+// re-writes it encrypted.
 func Load() (*Store, error) {
 	path, err := StorePath()
 	if err != nil {
@@ -98,11 +116,9 @@ func Load() (*Store, error) {
 	return s, nil
 }
 
-// applyLimitPolicy strips model-scoped windows from the cached usages when the
-// pool has opted out of them. Without this, opting out would not take effect
-// until every account re-polled: the cache alone can hold the pool in API-key
-// mode (see stillExhausted / soonestRecovery), for as long as the scoped
-// window's multi-day reset.
+// applyLimitPolicy strips opted-out scoped windows from the cached usages.
+// Without it, the cache alone could hold the pool in API-key mode for the whole
+// of a scoped window's multi-day reset, long after the opt-out.
 func (s *Store) applyLimitPolicy() {
 	if !s.IgnoreScopedLimits {
 		return
@@ -146,10 +162,13 @@ func (s *Store) Find(id string) *Account {
 	return nil
 }
 
-// Upsert adds a, or refreshes an existing account with the same ID.
+// Upsert adds a, or refreshes an existing account with the same ID. A replaced
+// blob clears any recorded auth failure, which is what makes re-import the cure
+// for a dead grant.
 func (s *Store) Upsert(a *Account) {
 	if existing := s.Find(a.ID); existing != nil {
 		existing.Blob = a.Blob
+		existing.AuthError = ""
 		if a.Email != "" {
 			existing.Email = a.Email
 		}
@@ -224,47 +243,53 @@ func (s *Store) PeekNextKey() *APIKey {
 	return s.APIKeys[(s.KeyCursor+1)%len(s.APIKeys)]
 }
 
-// LockedUpdate loads the store under an exclusive flock, applies fn, and saves
-// the result, making the read-modify-write atomic across the processes that
-// race through cc hooks (auto, helper, current). An error from fn aborts
-// without saving. The updated store is returned so callers can sync in-memory
-// state.
+// withFileLock runs fn holding an exclusive cross-process lock on path,
+// creating it if needed.
+func withFileLock(path string, fn func() error) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := lockFile(f); err != nil {
+		return err
+	}
+	defer unlockFile(f)
+	return fn()
+}
+
+// LockedUpdate makes a read-modify-write atomic across the processes that race
+// through cc hooks (auto, helper, current). An error from fn aborts without
+// saving.
 func LockedUpdate(fn func(*Store) error) (*Store, error) {
 	path, err := StorePath()
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, err
-	}
-	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	var s *Store
+	err = withFileLock(path+".lock", func() error {
+		if s, err = Load(); err != nil {
+			return err
+		}
+		if err := fn(s); err != nil {
+			return err
+		}
+		return s.Save()
+	})
 	if err != nil {
-		return nil, err
-	}
-	defer lock.Close()
-	if err := lockFile(lock); err != nil {
-		return nil, err
-	}
-	defer unlockFile(lock)
-
-	s, err := Load()
-	if err != nil {
-		return nil, err
-	}
-	if err := fn(s); err != nil {
-		return nil, err
-	}
-	if err := s.Save(); err != nil {
 		return nil, err
 	}
 	return s, nil
 }
 
-// Update runs fn under the store lock (load-modify-save, atomic across processes
-// via flock) and writes the resulting state back into s, so callers never hand-copy
-// individual fields. NOTE: this REPLACES s's contents (including the Accounts/APIKeys
-// slices) with the freshly-loaded post-save state, so any *Account pointer obtained
-// from s before the call is detached afterward — do not reuse such pointers after Update.
+// Update is LockedUpdate with the result written back into s.
+//
+// It REPLACES s's contents, slices included, with the freshly-loaded post-save
+// state: any *Account taken from s beforehand is detached afterward and must
+// not be reused.
 func (s *Store) Update(fn func(*Store) error) error {
 	ns, err := LockedUpdate(fn)
 	if err != nil {

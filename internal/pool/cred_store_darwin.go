@@ -44,10 +44,8 @@ func readCredential() (string, error) {
 }
 
 // writeCredential updates (or creates) Claude Code's credential item with blob.
-//
-// NOTE: the secret is passed via -w, briefly exposing it in this process's argv.
-// That is acceptable for a single-user local tool and mirrors how claude-swap
-// and Claude Code itself write the item.
+// The secret goes via -w, briefly exposing it in this process's argv — accepted
+// for a single-user local tool, and what Claude Code itself does.
 func writeCredential(blob string) error {
 	out, err := exec.Command("security", "add-generic-password",
 		"-U", "-s", keychainService, "-a", keychainAccount(), "-w", blob).CombinedOutput()
