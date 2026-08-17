@@ -18,13 +18,15 @@ next save.
 
 OAuth refresh tokens are **single-use**: a refresh retires the token it sent
 and returns a replacement. Two processes replaying one token read as a stolen
-token and cost the whole grant, permanently. So every `pool.Refresh` call must
-run inside `pool.WithRefreshLock` (per-credential, separate from the store
-lock; order is refresh lock → store lock) and re-read the store inside it, and
-must persist the returned blob. Claude Code rotates the active credential too,
-so anything overwriting the credential store harvests it first. A grant the
-server has permanently rejected is recorded in `Account.AuthError` and left
-alone until re-login, never retried.
+token and cost the whole grant, permanently. `pool.RefreshCredential` is the
+only way to reach the token endpoint — it holds the credential's lock, re-reads
+the authoritative blob inside it, and persists the rotation — so renew through
+it and never add a second caller of the unexported `refresh`. The refresh lock
+is per-credential and separate from the store lock; order is refresh lock →
+store lock. Commands load through `loadPool`, which harvests the rotation
+Claude Code may have made to the active credential before anything reads or
+overwrites a stored blob. A grant the server has permanently rejected is
+recorded in `Account.AuthError` and left alone until re-login, never retried.
 
 Tests must never reach the token endpoint — a refresh there consumes a real
 token. Point `oauthTokenURL` at an `httptest` server instead.
