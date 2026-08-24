@@ -36,8 +36,10 @@ func cmdHook(args []string) (err error) {
 	case "session-start":
 		return hookSessionStart()
 	case "background":
-		// Detached so a slow poll never freezes the session.
-		_ = spawnDetached("auto", "--if-needed", "--threshold", "0.9")
+		// Detached so a slow poll never freezes the session — which is also what
+		// makes this the one hook that can afford --keepalive, whose renewals run
+		// off cc's critical path entirely.
+		_ = spawnDetached("auto", "--if-needed", "--threshold", "0.9", "--keepalive")
 		return nil
 	case "stop-failure":
 		return cmdAuto(nil)

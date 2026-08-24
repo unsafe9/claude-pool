@@ -94,6 +94,78 @@ func TestStore_APIKeysAndRemove(t *testing.T) {
 	}
 }
 
+func TestStore_DisabledEntriesLeaveRotation(t *testing.T) {
+	s := &Store{
+		Accounts: []*Account{{ID: "a"}, {ID: "b", Disabled: true}},
+		APIKeys:  []*APIKey{{ID: "k1"}, {ID: "k2", Disabled: true}, {ID: "k3"}},
+	}
+
+	if got := s.EnabledAccounts(); len(got) != 1 || got[0].ID != "a" {
+		t.Errorf("EnabledAccounts = %v, want [a]", got)
+	}
+	if got := s.EnabledKeys(); len(got) != 2 {
+		t.Errorf("EnabledKeys = %d, want 2", len(got))
+	}
+
+	// The round-robin steps over k2 rather than serving a key taken out of
+	// rotation, and keeps cycling the rest.
+	for _, want := range []string{"k3", "k1", "k3"} {
+		if k := s.NextKey(); k == nil || k.ID != want {
+			t.Fatalf("NextKey = %v, want %s", k, want)
+		}
+	}
+
+	// Every key disabled reads as no keys at all, which is what demotes the pool
+	// out of API-key mode instead of leaving cc on a helper that can only fail.
+	for _, k := range s.APIKeys {
+		k.Disabled = true
+	}
+	if k := s.NextKey(); k != nil {
+		t.Errorf("NextKey = %v, want nil when every key is disabled", k)
+	}
+	if k := s.PeekNextKey(); k != nil {
+		t.Errorf("PeekNextKey = %v, want nil when every key is disabled", k)
+	}
+}
+
+func TestStore_SetDisabled(t *testing.T) {
+	s := &Store{Accounts: []*Account{{ID: "a"}}, APIKeys: []*APIKey{{ID: "k1"}}}
+
+	if kind, changed := s.SetDisabled("a", true); kind != "account" || !changed || !s.Find("a").Disabled {
+		t.Errorf("SetDisabled(account) = (%q, %v)", kind, changed)
+	}
+	// Idempotent, and says so: the caller reports "already disabled" rather than
+	// swapping the live credential a second time.
+	if _, changed := s.SetDisabled("a", true); changed {
+		t.Error("re-disabling reported a change")
+	}
+	if kind, changed := s.SetDisabled("k1", true); kind != "key" || !changed || !s.FindKey("k1").Disabled {
+		t.Errorf("SetDisabled(key) = (%q, %v)", kind, changed)
+	}
+	if kind, _ := s.SetDisabled("nope", true); kind != "" {
+		t.Errorf("SetDisabled(unknown) = %q, want empty", kind)
+	}
+}
+
+// Re-adding an entry is asking to use it, so it comes back in rotation — the
+// alternative is an import that silently lands on a disabled account.
+func TestStore_UpsertReenables(t *testing.T) {
+	s := &Store{}
+	s.Upsert(&Account{ID: "a", Blob: "old"})
+	s.Find("a").Disabled = true
+	s.Upsert(&Account{ID: "a", Blob: "new"})
+	if s.Find("a").Disabled {
+		t.Error("Upsert left the account disabled")
+	}
+
+	s.UpsertKey(&APIKey{ID: "k1", Key: "sk-1"})
+	s.FindKey("k1").Disabled = true
+	s.UpsertKey(&APIKey{ID: "k1", Key: "sk-2"})
+	if s.FindKey("k1").Disabled {
+		t.Error("UpsertKey left the key disabled")
+	}
+}
+
 // Opting out must reach the CACHED usages, not just fresh polls: while in
 // API-key mode the cache alone decides whether to re-poll, so a stale scoped
 // window would otherwise pin the pool to billed keys until its multi-day reset.

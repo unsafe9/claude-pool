@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -71,6 +72,33 @@ func TestSoonestRecovery(t *testing.T) {
 	}}
 	if got := soonestRecovery(s); !got.IsZero() {
 		t.Errorf("soonestRecovery with no exhausted account = %v, want zero", got)
+	}
+}
+
+func TestGrantNote(t *testing.T) {
+	now := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) *pool.Account {
+		return &pool.Account{Blob: fmt.Sprintf(
+			`{"claudeAiOauth":{"accessToken":"a","refreshTokenExpiresAt":%d}}`, now.Add(d).UnixMilli())}
+	}
+
+	// Far out: no note, or the warning becomes furniture nobody reads.
+	if got := grantNote(at(30*24*time.Hour), now); got != "" {
+		t.Errorf("30d out = %q, want no note", got)
+	}
+	if got := grantNote(at(51*time.Hour), now); got != "  login expires in 2d3h" {
+		t.Errorf("51h out = %q", got)
+	}
+	if got := grantNote(at(-time.Hour), now); got != "  login expired — re-login" {
+		t.Errorf("lapsed = %q", got)
+	}
+	// Credentials from before the field, and blobs that do not parse, say nothing
+	// rather than claiming an expiry of 1970.
+	if got := grantNote(&pool.Account{Blob: `{"claudeAiOauth":{"accessToken":"a"}}`}, now); got != "" {
+		t.Errorf("no deadline in blob = %q, want no note", got)
+	}
+	if got := grantNote(&pool.Account{Blob: "not json"}, now); got != "" {
+		t.Errorf("unparseable blob = %q, want no note", got)
 	}
 }
 

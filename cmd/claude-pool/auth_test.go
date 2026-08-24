@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -115,10 +116,68 @@ func TestAllAuthFailed(t *testing.T) {
 		{"all revoked", []*pool.Account{{ID: "a", AuthError: dead}, {ID: "b", AuthError: dead}}, true},
 		// Vacuous truth would strand an empty pool in the "needs re-login" arm.
 		{"empty pool", nil, false},
+		// A healthy account the user disabled is not auth the pool may fall back
+		// on, so the rotation really is out of logins.
+		{"only live account is out of rotation", []*pool.Account{{ID: "a", AuthError: dead}, {ID: "b", Disabled: true}}, true},
+		// Disabling everything is a choice, not a broken grant.
+		{"all disabled", []*pool.Account{{ID: "a", Disabled: true}}, false},
 	} {
 		if got := allAuthFailed(&pool.Store{Accounts: tc.accounts}); got != tc.want {
 			t.Errorf("%s: allAuthFailed = %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+// The idle account is the one keepalive exists for, so it must renew an account
+// nothing selects — while leaving a live token alone (each renewal spends a
+// single-use refresh token) and never retrying a grant the server killed.
+func TestKeepAlive(t *testing.T) {
+	// The store already holds a rotation for "idle", so ensureFresh adopts it
+	// instead of reaching the token endpoint.
+	withPoolStore(t,
+		&pool.Account{ID: "idle", Blob: blob("rotated", time.Hour), Disabled: true},
+		&pool.Account{ID: "live", Blob: blob("live", time.Hour)},
+		&pool.Account{ID: "dead", Blob: blob("stale", -time.Hour), AuthError: "token refresh: HTTP 400 invalid_grant"},
+	)
+	s, err := pool.Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// What a hook holds in memory: the parked account expired where it sat.
+	s.Find("idle").Blob = blob("stale", -time.Hour)
+	deadBlob := s.Find("dead").Blob
+
+	keepAlive(s)
+
+	if od, _ := pool.ParseBlob(s.Find("idle").Blob); od.AccessToken != "rotated" {
+		t.Errorf("idle account not renewed: AccessToken = %q", od.AccessToken)
+	}
+	if od, _ := pool.ParseBlob(s.Find("live").Blob); od.AccessToken != "live" {
+		t.Errorf("live account touched: AccessToken = %q", od.AccessToken)
+	}
+	if s.Find("dead").Blob != deadBlob {
+		t.Error("revoked grant was retried")
+	}
+}
+
+// Disabled accounts drop out of scoring the way failed polls do, but for a
+// reason the caller can tell apart — and without a request.
+func TestPollAccounts_SkipsDisabled(t *testing.T) {
+	s := &pool.Store{Accounts: []*pool.Account{
+		{ID: "off", Disabled: true, Blob: blob("x", time.Hour)},
+		{ID: "broken", Blob: `{}`}, // ParseBlob fails before any request
+	}}
+
+	usages, errs := pollAccounts(s, nil)
+
+	if !errors.Is(errs[0], errDisabled) {
+		t.Errorf("errs[off] = %v, want errDisabled", errs[0])
+	}
+	if errs[1] == nil || errors.Is(errs[1], errDisabled) {
+		t.Errorf("errs[broken] = %v, want a poll failure", errs[1])
+	}
+	if best, _, polled := bestAccount(s, usages, errs); best != nil || polled != 0 {
+		t.Errorf("bestAccount = (%v, polled=%d), want nothing selectable", best, polled)
 	}
 }
 

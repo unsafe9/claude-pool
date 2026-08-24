@@ -9,11 +9,17 @@ import (
 // OAuthData mirrors the claudeAiOauth object Claude Code stores in the Keychain
 // (macOS) or ~/.claude/.credentials.json (Linux/Windows).
 type OAuthData struct {
-	AccessToken      string   `json:"accessToken"`
-	RefreshToken     string   `json:"refreshToken"`
-	ExpiresAt        int64    `json:"expiresAt"` // epoch milliseconds
-	Scopes           []string `json:"scopes,omitempty"`
-	SubscriptionType string   `json:"subscriptionType,omitempty"`
+	AccessToken  string `json:"accessToken"`
+	RefreshToken string `json:"refreshToken"`
+	ExpiresAt    int64  `json:"expiresAt"` // epoch milliseconds
+	// RefreshTokenExpiresAt is the deadline Claude Code recorded for the grant
+	// (epoch milliseconds; zero on credentials that predate the field). The
+	// token endpoint's response carries no field we recognize as a newer one, so
+	// a rotation carries this value forward as-is — read it as advisory: worth
+	// warning about, never grounds for refusing a refresh.
+	RefreshTokenExpiresAt int64    `json:"refreshTokenExpiresAt,omitempty"`
+	Scopes                []string `json:"scopes,omitempty"`
+	SubscriptionType      string   `json:"subscriptionType,omitempty"`
 }
 
 type credBlob struct {

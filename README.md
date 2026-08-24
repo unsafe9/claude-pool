@@ -77,6 +77,7 @@ account mode ◀──(any account resets)───── API-key mode
 ```
 
 - **Errors are not exhaustion**: an account whose usage poll fails is skipped, not treated as exhausted — and if every poll fails, `auto` stays on the current credential instead of dumping you onto API keys over a network blip.
+- **Idle accounts**: an account nothing selects was never refreshed at all, and a login carries a deadline (`refreshTokenExpiresAt` in the credential) that no refresh is known to push back — so the account parked while another one does the work is the one that quietly dies, and you find out at the worst moment. Every prompt renews the stored accounts whose access token has lapsed, disabled ones included; an account with a live token is skipped, so this costs at most one request per token lifetime. That keeps parked credentials current and surfaces a dead grant while another account is still carrying the load. `list` counts the last week down (`login expires in 5d3h`), which is the cue to log in again before you need that account.
 - **Token rotation**: refresh tokens are single-use — each refresh retires the token it sent and issues a replacement. Two processes replaying one token would look like a stolen-token reuse and cost you the whole grant, so every refresh runs under a per-credential cross-process lock and re-reads the store inside it, adopting a rotation another process just stored rather than replaying its own. Claude Code rotates the active credential too, so anything about to overwrite the credential store harvests what is there first.
 - **Self-healing**: every run reconciles the store, settings, and credential store. Hand-deleting the `apiKeyHelper` is respected. A credential that Claude Code itself refreshed is harvested back into the pool, attributed to the right account by email via the profile API (renewing it first if it expired in place). A foreign `apiKeyHelper` you already had is preserved and restored when claude-pool leaves API-key mode.
 - **Dead grants**: if the server permanently rejects a stored credential — a refresh token revoked, or retired by a login elsewhere — the account is marked instead of retried, since nothing but a fresh login can repair it. `list` shows it as `re-login required` with the reason; log into Claude Code as that account and re-import it under the same name to clear the mark.
@@ -99,6 +100,8 @@ The hooks drive everything through `claude-pool auto`; the same binary doubles a
 ```bash
 claude-pool list           # accounts with live usage per window, then keys
 claude-pool switch work    # switch to a specific account
+claude-pool disable work   # keep the account, hold it out of rotation
+claude-pool enable work    # put it back
 claude-pool rm console1    # remove an account or API key
 claude-pool config         # show settings
 claude-pool config scoped-limits off   # stop counting model-scoped quotas (e.g. Fable)
@@ -106,6 +109,8 @@ claude-pool status         # active auth profile as JSON (no network)
 claude-pool helper         # apiKeyHelper hook for cc (managed by auto, not for manual use)
 claude-pool version        # build version
 ```
+
+`disable` is `rm` without the loss: the entry stays in the pool, and a disabled account's credential is still renewed, so putting it back needs nothing else. Nothing selects, polls or scores a disabled entry — `list` shows it as `disabled`, and disabling the account Claude Code is currently on (or the key it is billing) swaps immediately to whatever is left, down to falling back to API keys. Re-importing an account or re-adding a key puts it back in rotation.
 
 `status` is network-free, so a custom statusline script can call it on every render. It prints `{"mode","name"}` — `mode` is `account` or `apikey`, `name` is the active account or key id — and in API-key mode adds `"resets_at"` and `"reset_in_seconds"`: how long until an account is expected to free up and subscription auth resumes (read from the usage cache, omitted when unknown). For example, in a Claude Code [statusLine](https://code.claude.com/docs/en/statusline.md) script — a gray `[work]` on subscription, a red `[key:console2 40m]` billing warning while on an API key:
 
@@ -150,6 +155,7 @@ Source builds report version `dev` and are never replaced by the plugin's self-u
 - On Windows, the first-run bootstrap runs through Git Bash (Claude Code resolves it from your Git for Windows install). Without Git for Windows there is no auto-install and the bootstrap hook reports a one-line error each session start — install the binary once with the PowerShell one-liner above; everything else works.
 - On Linux/WSL/Windows, credentials are a plaintext `~/.claude/.credentials.json` — that is Claude Code's own storage on those platforms; claude-pool reads and writes the same file in the same format (no change to your security posture either way).
 - On macOS, the first Keychain access may pop a permission prompt — choose **Always Allow** to avoid future prompts.
+- A login can expire on the server's own schedule however faithfully its token is renewed, so an account left alone long enough — or a machine you leave Claude Code closed on — eventually needs `claude /login` and a re-import. `list` warns for the last week before the deadline its credential records.
 - The refresh lock covers claude-pool's own processes; Claude Code refreshes the active credential on its own schedule and cannot be locked against. Harvesting keeps the two in sync, but a login to the same account elsewhere still retires the stored token and needs a re-import.
 - Toggling API-key mode rewrites `~/.claude/settings.json`. Symlinks are resolved and preserved, but JSON key order is not.
 - Running multiple consumer subscription accounts may sit against Anthropic's consumer terms of service. Use at your own risk.

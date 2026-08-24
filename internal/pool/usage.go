@@ -169,6 +169,10 @@ func (u Usage) FormatStatusline(now time.Time) string {
 	return strings.Join(parts, " ")
 }
 
+// ShortDur formats a duration the way the usage line does — "6d8h", "4h40m",
+// "40m" — for callers outside this file that render a countdown next to one.
+func ShortDur(d time.Duration) string { return shortDur(d, true) }
+
 // shortDur formats a duration as "6d8h" (days mode), "4h40m", or "40m".
 func shortDur(d time.Duration, days bool) string {
 	if d < 0 {

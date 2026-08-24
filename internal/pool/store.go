@@ -25,6 +25,11 @@ type Account struct {
 	// cc-side login) clears it.
 	AuthError string `json:"auth_error,omitempty"`
 
+	// Disabled holds the account out of rotation without discarding it: nothing
+	// selects or polls it. Its credential is still renewed, so enabling it later
+	// needs nothing else.
+	Disabled bool `json:"disabled,omitempty"`
+
 	Usage   *Usage    `json:"usage,omitempty"`    // last polled usage (cache)
 	UsageAt time.Time `json:"usage_at,omitempty"` // when Usage was fetched
 }
@@ -38,6 +43,8 @@ func (a *Account) Revoked() bool { return a.AuthError != "" }
 type APIKey struct {
 	ID  string `json:"id"`
 	Key string `json:"key"`
+	// Disabled holds the key out of the round-robin without discarding it.
+	Disabled bool `json:"disabled,omitempty"`
 }
 
 // Modes: accounts are always preferred; apikey is the fallback once every
@@ -164,17 +171,60 @@ func (s *Store) Find(id string) *Account {
 
 // Upsert adds a, or refreshes an existing account with the same ID. A replaced
 // blob clears any recorded auth failure, which is what makes re-import the cure
-// for a dead grant.
+// for a dead grant, and puts a disabled account back in rotation: importing an
+// account is asking to use it.
 func (s *Store) Upsert(a *Account) {
 	if existing := s.Find(a.ID); existing != nil {
 		existing.Blob = a.Blob
 		existing.AuthError = ""
+		existing.Disabled = false
 		if a.Email != "" {
 			existing.Email = a.Email
 		}
 		return
 	}
 	s.Accounts = append(s.Accounts, a)
+}
+
+// EnabledAccounts is the accounts eligible for selection — every path that
+// picks, polls or counts accounts for a swap decision goes through it, so a
+// disabled one is invisible to all of them.
+func (s *Store) EnabledAccounts() []*Account {
+	out := make([]*Account, 0, len(s.Accounts))
+	for _, a := range s.Accounts {
+		if !a.Disabled {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// EnabledKeys is the API keys the round-robin may serve.
+func (s *Store) EnabledKeys() []*APIKey {
+	out := make([]*APIKey, 0, len(s.APIKeys))
+	for _, k := range s.APIKeys {
+		if !k.Disabled {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// SetDisabled flips the flag on the account or API key named id. kind is
+// "account" or "key", or empty when nothing matched; changed reports whether
+// the entry was not already in that state.
+func (s *Store) SetDisabled(id string, disabled bool) (kind string, changed bool) {
+	if a := s.Find(id); a != nil {
+		changed = a.Disabled != disabled
+		a.Disabled = disabled
+		return "account", changed
+	}
+	if k := s.FindKey(id); k != nil {
+		changed = k.Disabled != disabled
+		k.Disabled = disabled
+		return "key", changed
+	}
+	return "", false
 }
 
 // FindKey returns the API key with the given ID, or nil.
@@ -187,10 +237,12 @@ func (s *Store) FindKey(id string) *APIKey {
 	return nil
 }
 
-// UpsertKey adds k, or replaces the key of an existing entry with the same ID.
+// UpsertKey adds k, or replaces the key of an existing entry with the same ID,
+// returning it to the round-robin if it was disabled.
 func (s *Store) UpsertKey(k *APIKey) {
 	if existing := s.FindKey(k.ID); existing != nil {
 		existing.Key = k.Key
+		existing.Disabled = false
 		return
 	}
 	s.APIKeys = append(s.APIKeys, k)
@@ -223,24 +275,38 @@ func (s *Store) Remove(id string) bool {
 	return false
 }
 
-// NextKey advances the round-robin cursor and returns the next API key, or nil
-// if none are registered. The caller is responsible for saving the store.
+// NextKey advances the round-robin cursor and returns the next enabled API key,
+// or nil if none are. The caller is responsible for saving the store.
 func (s *Store) NextKey() *APIKey {
-	if len(s.APIKeys) == 0 {
+	i := s.nextKeyIndex()
+	if i < 0 {
 		return nil
 	}
-	s.KeyCursor = (s.KeyCursor + 1) % len(s.APIKeys)
-	k := s.APIKeys[s.KeyCursor]
-	s.CurrentKey = k.ID
-	return k
+	s.KeyCursor = i
+	s.CurrentKey = s.APIKeys[i].ID
+	return s.APIKeys[i]
 }
 
 // PeekNextKey returns the key NextKey would serve next, without advancing.
 func (s *Store) PeekNextKey() *APIKey {
-	if len(s.APIKeys) == 0 {
+	i := s.nextKeyIndex()
+	if i < 0 {
 		return nil
 	}
-	return s.APIKeys[(s.KeyCursor+1)%len(s.APIKeys)]
+	return s.APIKeys[i]
+}
+
+// nextKeyIndex scans forward from the cursor for the next enabled key, so
+// disabled entries are stepped over rather than serving a key the user has
+// taken out of rotation. Returns -1 when every key is disabled.
+func (s *Store) nextKeyIndex() int {
+	for n := 1; n <= len(s.APIKeys); n++ {
+		i := (s.KeyCursor + n) % len(s.APIKeys)
+		if !s.APIKeys[i].Disabled {
+			return i
+		}
+	}
+	return -1
 }
 
 // withFileLock runs fn holding an exclusive cross-process lock on path,

@@ -45,6 +45,10 @@ func main() {
 		err = cmdKey(os.Args[2:])
 	case "rm":
 		err = cmdRemove(os.Args[2:])
+	case "disable":
+		err = cmdSetDisabled(os.Args[2:], true)
+	case "enable":
+		err = cmdSetDisabled(os.Args[2:], false)
 	case "list", "ls":
 		err = cmdList(os.Args[2:])
 	case "switch":
@@ -92,6 +96,10 @@ Usage:
                                       Register an API key (omit KEY to read
                                       stdin; default name: timestamp)
   claude-pool rm <id>                 Remove an account or API key
+  claude-pool disable <id>            Keep an account or API key, but hold it
+                                      out of rotation (its credential is still
+                                      renewed); swaps away if it was in use
+  claude-pool enable <id>             Put it back in rotation
   claude-pool list [--json]           Show accounts (with 5h/7d usage) and keys;
                                       --json dumps pool state (no network/secrets)
   claude-pool switch <id>             Switch to a specific account
@@ -101,6 +109,9 @@ Usage:
                                       keys until one resets
         --if-needed         Only act if the current account is over --threshold
         --threshold 0.0-1.0 Binding-utilization trigger for --if-needed (default 0.8)
+        --keepalive         Also renew idle accounts, so a parked credential
+                            stays current and a dead grant surfaces early
+                            (the per-prompt hook passes this)
         --launch            Exec `+"`claude`"+` after switching (pass cc args after --)
   claude-pool config [SETTING [on|off]]
                                       Show settings, or set one:
@@ -148,6 +159,40 @@ func ensureFresh(a *pool.Account) (pool.OAuthData, error) {
 	}
 	a.Blob = blob
 	return pool.ParseBlob(blob)
+}
+
+// keepAlive renews every stored account whose access token has lapsed —
+// including the ones no swap would ever pick.
+//
+// An idle account is what dies otherwise. The per-prompt hook runs
+// `auto --if-needed`, which polls the current account alone, so a second
+// account can sit untouched for weeks; the login behind it expires on its own
+// schedule (`refreshTokenExpiresAt` in the blob) and only a re-login brings it
+// back. Renewing on a cadence keeps the pool's stored credentials usable and
+// surfaces a grant that has died while the account was parked, instead of
+// discovering it at the moment the active account runs out.
+//
+// Self-limiting: an account whose access token is still live is skipped, so
+// each costs at most one request per token lifetime. Best-effort and silent —
+// ensureFresh records a dead grant for `list` to report, and anything else is a
+// transient the next run retries.
+func keepAlive(s *pool.Store) {
+	var wg sync.WaitGroup
+	for _, a := range s.Accounts {
+		if a.Revoked() {
+			continue
+		}
+		od, err := pool.ParseBlob(a.Blob)
+		if err != nil || !pool.IsExpired(od.ExpiresAt) {
+			continue
+		}
+		wg.Add(1)
+		go func(a *pool.Account) {
+			defer wg.Done()
+			_, _ = ensureFresh(a)
+		}(a)
+	}
+	wg.Wait()
 }
 
 // storedBlob re-reads a's credential from disk, so a rotation another process
@@ -240,9 +285,9 @@ func isOurHelper(cmd string) bool {
 }
 
 // reconcile repairs the store/settings pair when they have desynced: keys
-// removed out from under apikey mode, our helper hand-deleted or replaced by
-// the user (their edit wins), or a helper left installed by a crashed
-// transition.
+// removed or disabled out from under apikey mode, our helper hand-deleted or
+// replaced by the user (their edit wins), or a helper left installed by a
+// crashed transition.
 func reconcile(s *pool.Store) error {
 	helper, err := pool.GetAPIKeyHelper()
 	if err != nil {
@@ -250,7 +295,7 @@ func reconcile(s *pool.Store) error {
 	}
 	ours := isOurHelper(helper)
 	switch {
-	case s.Mode == pool.ModeAPIKey && len(s.APIKeys) == 0:
+	case s.Mode == pool.ModeAPIKey && len(s.EnabledKeys()) == 0:
 		if ours {
 			if err := pool.RestoreAPIKeyHelper(s.SavedHelper); err != nil {
 				return err
@@ -315,19 +360,23 @@ func harvest(s *pool.Store) {
 				e.Blob = kc
 				e.AuthError = "" // a working credential supersedes a dead grant
 			}
-			if st.Mode != pool.ModeAPIKey {
+			// A disabled account can own the live credential — cc was logged
+			// into it directly — and its rotation still has to be stored, or it
+			// is left on a retired token. Only the pointer is withheld: the
+			// account is out of rotation, so the next auto moves cc off it.
+			if st.Mode != pool.ModeAPIKey && !a.Disabled {
 				st.Current = a.ID
 			}
 			return nil
 		})
 		a.Blob, a.AuthError = kc, ""
-		if s.Mode != pool.ModeAPIKey {
+		if s.Mode != pool.ModeAPIKey && !a.Disabled {
 			s.Current = a.ID
 		}
 	}
 	for _, a := range s.Accounts {
 		if a.Blob == kc {
-			if s.Mode != pool.ModeAPIKey && s.Current != a.ID {
+			if s.Mode != pool.ModeAPIKey && !a.Disabled && s.Current != a.ID {
 				adopt(a)
 			}
 			return
@@ -396,9 +445,13 @@ func cmdImport(args []string) error {
 	}
 
 	name := *id
+	var reenabled bool
 	s, err := pool.LockedUpdate(func(st *pool.Store) error {
 		if name == "" {
 			name = autoAccountID(st, email)
+		}
+		if e := st.Find(name); e != nil {
+			reenabled = e.Disabled
 		}
 		st.Upsert(&pool.Account{ID: name, Email: email, Blob: blob})
 		return nil
@@ -412,6 +465,9 @@ func cmdImport(args []string) error {
 		return err
 	}
 	fmt.Printf("imported current account as %q (%d total)\n", name, len(s.Accounts))
+	if reenabled {
+		fmt.Printf("%q was disabled; importing it put it back in rotation\n", name)
+	}
 	return nil
 }
 
@@ -524,8 +580,8 @@ func cmdRemove(args []string) error {
 		if err != nil {
 			return err
 		}
-		if len(s.Accounts) > 0 {
-			a := s.Accounts[0]
+		if enabled := s.EnabledAccounts(); len(enabled) > 0 {
+			a := enabled[0]
 			if err := useAccount(s, a); err != nil {
 				return err
 			}
@@ -534,6 +590,52 @@ func cmdRemove(args []string) error {
 	}
 	fmt.Printf("removed %q\n", args[0])
 	return nil
+}
+
+// cmdSetDisabled implements `disable` and `enable`: an entry the pool keeps but
+// must not use. Unlike `rm` the credential stays, and the keepalive pass goes
+// on renewing it, so enabling it later needs nothing else.
+//
+// Disabling what cc is currently authenticated as hands the session on: `auto`
+// re-picks from what is left, down to falling back to API keys, so the toggle
+// takes effect immediately rather than at the next hook.
+func cmdSetDisabled(args []string, disabled bool) error {
+	cmd, verb := "enable", "enabled"
+	if disabled {
+		cmd, verb = "disable", "disabled"
+	}
+	if len(args) < 1 {
+		return fmt.Errorf("usage: claude-pool %s <id>", cmd)
+	}
+	id := args[0]
+
+	var kind string
+	var changed bool
+	s, err := pool.LockedUpdate(func(st *pool.Store) error {
+		if kind, changed = st.SetDisabled(id, disabled); kind == "" {
+			return fmt.Errorf("no account or API key %q (see `claude-pool list`)", id)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if !changed {
+		fmt.Printf("%s %q is already %s\n", kind, id, verb)
+		return nil
+	}
+	fmt.Printf("%s %q %s\n", kind, id, verb)
+
+	live := (kind == "account" && s.Mode != pool.ModeAPIKey && s.Current == id) ||
+		(kind == "key" && s.Mode == pool.ModeAPIKey && s.CurrentKey == id)
+	if !disabled || !live {
+		return nil
+	}
+	if len(s.EnabledAccounts()) == 0 && len(s.EnabledKeys()) == 0 {
+		fmt.Fprintln(os.Stderr, "claude-pool: nothing left in rotation; Claude Code keeps using the credential it holds")
+		return nil
+	}
+	return cmdAuto(nil)
 }
 
 func cmdList(args []string) error {
@@ -551,8 +653,9 @@ func cmdList(args []string) error {
 			return err
 		}
 		type entry struct {
-			ID    string `json:"id"`
-			Email string `json:"email,omitempty"`
+			ID       string `json:"id"`
+			Email    string `json:"email,omitempty"`
+			Disabled bool   `json:"disabled,omitempty"`
 		}
 		out := struct {
 			Mode       string  `json:"mode"`
@@ -571,10 +674,10 @@ func cmdList(args []string) error {
 			out.Mode = pool.ModeAccount
 		}
 		for _, a := range s.Accounts {
-			out.Accounts = append(out.Accounts, entry{ID: a.ID, Email: a.Email})
+			out.Accounts = append(out.Accounts, entry{ID: a.ID, Email: a.Email, Disabled: a.Disabled})
 		}
 		for _, k := range s.APIKeys {
-			out.APIKeys = append(out.APIKeys, entry{ID: k.ID})
+			out.APIKeys = append(out.APIKeys, entry{ID: k.ID, Disabled: k.Disabled})
 		}
 		return json.NewEncoder(os.Stdout).Encode(out)
 	}
@@ -597,6 +700,16 @@ func cmdList(args []string) error {
 			marker = "* "
 		}
 		switch {
+		// Out of rotation outranks the rest: it is the state the user chose, and
+		// an account they parked should not be nagging for a re-login.
+		case a.Disabled:
+			state := "disabled"
+			if a.AuthError != "" {
+				state += " (re-login required)"
+			} else {
+				state += grantNote(a, now)
+			}
+			fmt.Printf("%s%-16s  %s\n", marker, a.ID, state)
 		// A dead grant is a standing state, not a failed poll.
 		case a.AuthError != "":
 			needLogin = append(needLogin, a.ID)
@@ -604,7 +717,7 @@ func cmdList(args []string) error {
 		case errs[i] != nil:
 			fmt.Printf("%s%-16s  (error: %v)\n", marker, a.ID, errs[i])
 		default:
-			fmt.Printf("%s%-16s  %s\n", marker, a.ID, usages[i].FormatStatusline(now))
+			fmt.Printf("%s%-16s  %s%s\n", marker, a.ID, usages[i].FormatStatusline(now), grantNote(a, now))
 		}
 	}
 	for _, k := range s.APIKeys {
@@ -612,7 +725,11 @@ func cmdList(args []string) error {
 		if k.ID == s.CurrentKey && s.Mode == pool.ModeAPIKey {
 			marker = "* "
 		}
-		fmt.Printf("%skey:%-12s  %s\n", marker, k.ID, maskKey(k.Key))
+		state := ""
+		if k.Disabled {
+			state = "  disabled"
+		}
+		fmt.Printf("%skey:%-12s  %s%s\n", marker, k.ID, maskKey(k.Key), state)
 	}
 	if len(needLogin) > 0 {
 		fmt.Fprintf(os.Stderr, "\nTo repair: log into Claude Code as the account, then re-import it under the same name:\n")
@@ -621,6 +738,31 @@ func cmdList(args []string) error {
 		}
 	}
 	return nil
+}
+
+// grantWarnWindow is how long before a login lapses that `list` starts saying
+// so: long enough to re-login at a convenient moment, short enough that the
+// note is not permanent furniture.
+const grantWarnWindow = 7 * 24 * time.Hour
+
+// grantNote warns that an account is nearing the deadline recorded in its
+// credential, as a suffix for the list line. Nothing claude-pool does is known
+// to push that deadline back, so this is the only notice before the account
+// needs logging into again — but the server, not this number, is what decides
+// whether a grant still works.
+func grantNote(a *pool.Account, now time.Time) string {
+	od, err := pool.ParseBlob(a.Blob)
+	if err != nil || od.RefreshTokenExpiresAt == 0 {
+		return ""
+	}
+	left := time.UnixMilli(od.RefreshTokenExpiresAt).Sub(now)
+	switch {
+	case left <= 0:
+		return "  login expired — re-login"
+	case left <= grantWarnWindow:
+		return "  login expires in " + pool.ShortDur(left)
+	}
+	return ""
 }
 
 func cmdSwitch(args []string) error {
@@ -635,6 +777,9 @@ func cmdSwitch(args []string) error {
 	a := s.Find(id)
 	if a == nil {
 		return fmt.Errorf("no account %q (see `claude-pool list`)", id)
+	}
+	if a.Disabled {
+		return fmt.Errorf("account %q is disabled; run `claude-pool enable %s` first", id, id)
 	}
 	if _, err := ensureFresh(a); err != nil {
 		return err
@@ -651,6 +796,7 @@ func cmdAuto(args []string) error {
 	fs := newFlagSet("auto")
 	ifNeeded := fs.Bool("if-needed", false, "only act if the current account is over --threshold")
 	threshold := fs.Float64("threshold", 0.8, "binding-utilization trigger for --if-needed (0.0-1.0)")
+	keepalive := fs.Bool("keepalive", false, "also renew idle accounts, so parked credentials stay current")
 	launch := fs.Bool("launch", false, "exec `claude` after switching")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -665,7 +811,14 @@ func cmdAuto(args []string) error {
 
 	// --launch always execs claude: a pool failure must not block cc from
 	// starting on whatever credential it already holds.
+	//
+	// Keepalive rides here rather than at the top so it runs on every exit path
+	// — including the fast path, which is where an idle account otherwise never
+	// gets touched — but never delays the swap decision it follows.
 	finish := func(err error) error {
+		if *keepalive {
+			keepAlive(s)
+		}
 		if *launch {
 			if err != nil {
 				fmt.Fprintln(os.Stderr, "claude-pool:", err)
@@ -679,12 +832,17 @@ func cmdAuto(args []string) error {
 		fmt.Fprintln(os.Stderr, "claude-pool: reconcile:", err)
 	}
 
-	// Empty pool: nothing to manage — silent no-op keeps global hooks quiet.
-	if len(s.Accounts) == 0 && len(s.APIKeys) == 0 {
+	// Disabled entries are invisible from here down: every count, poll and pick
+	// runs over what the user left in rotation.
+	accounts, keys := s.EnabledAccounts(), s.EnabledKeys()
+
+	// Nothing in rotation: no-op, silent enough for a global hook. cc keeps the
+	// credential it holds.
+	if len(accounts) == 0 && len(keys) == 0 {
 		return finish(nil)
 	}
 	// Keys-only pool: nothing to prefer, go straight to the keys.
-	if len(s.Accounts) == 0 {
+	if len(accounts) == 0 {
 		if s.Mode != pool.ModeAPIKey {
 			return finish(enterAPIKeyMode(s))
 		}
@@ -692,8 +850,11 @@ func cmdAuto(args []string) error {
 	}
 
 	// Single account with no keys: nothing to switch between, though loadPool's
-	// harvest still keeps the stored blob in sync with cc's.
-	if len(s.Accounts) == 1 && len(s.APIKeys) == 0 {
+	// harvest still keeps the stored blob in sync with cc's. Only while cc is
+	// actually on that account — after a disable it is not, and putting it back
+	// is the whole job.
+	if len(accounts) == 1 && len(keys) == 0 &&
+		s.Mode != pool.ModeAPIKey && s.Current == accounts[0].ID {
 		return finish(nil)
 	}
 
@@ -702,7 +863,9 @@ func cmdAuto(args []string) error {
 	// returning to an account the moment one resets requires polling them all.
 	var curUsage *pool.Usage
 	if *ifNeeded && s.Mode != pool.ModeAPIKey {
-		if cur := s.Find(s.Current); cur != nil {
+		// A current account that has since been disabled gets no fast path: the
+		// point is to move off it, however much headroom it has left.
+		if cur := s.Find(s.Current); cur != nil && !cur.Disabled {
 			if u, err := usageFor(s, cur); err == nil {
 				if u.Score() < *threshold*100 {
 					return finish(nil)
@@ -718,7 +881,7 @@ func cmdAuto(args []string) error {
 	// which is why the fast path above keeps polling it.
 	if s.Mode == pool.ModeAPIKey {
 		allStillExhausted := true
-		for _, a := range s.Accounts {
+		for _, a := range accounts {
 			if !stillExhausted(a, now) {
 				allStillExhausted = false
 				break
@@ -782,13 +945,23 @@ func cmdAuto(args []string) error {
 	}
 }
 
-// pollAccounts fetches every account's usage concurrently. cur, when non-nil,
-// is reused as s.Current's result instead of re-polling it.
+// errDisabled marks an account the poll skipped because it is out of rotation,
+// so scoring drops it the way it drops a failed poll while `list` can still
+// report it as the standing state it is.
+var errDisabled = errors.New("disabled")
+
+// pollAccounts fetches every enabled account's usage concurrently. cur, when
+// non-nil, is reused as s.Current's result instead of re-polling it. The
+// returned slices stay indexed parallel to s.Accounts.
 func pollAccounts(s *pool.Store, cur *pool.Usage) ([]pool.Usage, []error) {
 	usages := make([]pool.Usage, len(s.Accounts))
 	errs := make([]error, len(s.Accounts))
 	var wg sync.WaitGroup
 	for i, a := range s.Accounts {
+		if a.Disabled {
+			errs[i] = errDisabled
+			continue
+		}
 		if cur != nil && a.ID == s.Current {
 			usages[i] = *cur
 			continue
@@ -808,13 +981,14 @@ func pollAccounts(s *pool.Store, cur *pool.Usage) ([]pool.Usage, []error) {
 	return usages, errs
 }
 
-// allAuthFailed reports whether every account needs a fresh login. An empty
-// pool is not "all revoked" — callers read this as a standing verdict.
+// allAuthFailed reports whether every account in rotation needs a fresh login.
+// An empty pool is not "all revoked" — callers read this as a standing verdict.
 func allAuthFailed(s *pool.Store) bool {
-	if len(s.Accounts) == 0 {
+	accounts := s.EnabledAccounts()
+	if len(accounts) == 0 {
 		return false
 	}
-	for _, a := range s.Accounts {
+	for _, a := range accounts {
 		if !a.Revoked() {
 			return false
 		}
@@ -977,7 +1151,7 @@ func useAccount(s *pool.Store, a *pool.Account) error {
 func enterAPIKeyMode(s *pool.Store) error {
 	next := s.PeekNextKey()
 	if next == nil {
-		return fmt.Errorf("no API keys registered")
+		return fmt.Errorf("no API keys in rotation")
 	}
 	prevHelper, err := pool.GetAPIKeyHelper()
 	if err != nil {
@@ -1026,7 +1200,7 @@ func cmdHelper() error {
 		}
 		k := st.NextKey()
 		if k == nil {
-			return fmt.Errorf("no API keys registered")
+			return fmt.Errorf("no API keys in rotation")
 		}
 		key = k.Key
 		return nil
@@ -1120,12 +1294,12 @@ func cmdStatus() error {
 	return json.NewEncoder(os.Stdout).Encode(out)
 }
 
-// soonestRecovery is the earliest moment any account is expected to leave
-// exhaustion, from each account's cached usage — i.e. roughly when API-key mode
-// can end. Zero when no account has a known usable-at time.
+// soonestRecovery is the earliest moment any account in rotation is expected to
+// leave exhaustion, from each account's cached usage — i.e. roughly when
+// API-key mode can end. Zero when no account has a known usable-at time.
 func soonestRecovery(s *pool.Store) time.Time {
 	var soonest time.Time
-	for _, a := range s.Accounts {
+	for _, a := range s.EnabledAccounts() {
 		if a.Usage == nil {
 			continue
 		}

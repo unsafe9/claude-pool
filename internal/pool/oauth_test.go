@@ -137,4 +137,10 @@ func TestRefresh_StoresRotatedToken(t *testing.T) {
 	if IsExpired(od.ExpiresAt) {
 		t.Errorf("ExpiresAt = %v, want ~1h out", time.UnixMilli(od.ExpiresAt))
 	}
+	// The endpoint returns no deadline for the replacement token, so the grant's
+	// own expiry has to survive the rewrite — it is what `list` counts down and
+	// the only warning before the account needs a re-login.
+	if od.RefreshTokenExpiresAt != 1782000000000 {
+		t.Errorf("RefreshTokenExpiresAt = %d, want the blob's own value carried through", od.RefreshTokenExpiresAt)
+	}
 }

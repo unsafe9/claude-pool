@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-const sampleBlob = `{"claudeAiOauth":{"accessToken":"sk-ant-oat-abc","refreshToken":"sk-ant-ort-xyz","expiresAt":1780000000000,"scopes":["user:inference","user:profile"],"subscriptionType":"max"}}`
+const sampleBlob = `{"claudeAiOauth":{"accessToken":"sk-ant-oat-abc","refreshToken":"sk-ant-ort-xyz","expiresAt":1780000000000,"refreshTokenExpiresAt":1782000000000,"scopes":["user:inference","user:profile"],"subscriptionType":"max"}}`
 
 func TestParseBlob(t *testing.T) {
 	od, err := ParseBlob(sampleBlob)
@@ -20,6 +20,10 @@ func TestParseBlob(t *testing.T) {
 	}
 	if od.ExpiresAt != 1780000000000 {
 		t.Errorf("ExpiresAt = %d", od.ExpiresAt)
+	}
+	// The grant's own deadline: what tells an idle account apart from a dead one.
+	if od.RefreshTokenExpiresAt != 1782000000000 {
+		t.Errorf("RefreshTokenExpiresAt = %d", od.RefreshTokenExpiresAt)
 	}
 	if od.SubscriptionType != "max" {
 		t.Errorf("SubscriptionType = %q", od.SubscriptionType)
