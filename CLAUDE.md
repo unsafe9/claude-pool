@@ -33,11 +33,11 @@ The token endpoint's response has no field we recognize as a newer one, so a
 rotation carries the stored value forward as-is — it goes stale if the server
 slides the real deadline. `list` counts it down, and that is all it may do:
 the server stays the authority on whether a grant is still good, so never let
-a local deadline refuse a refresh. An account
-nothing selects still has to be renewed — that is what `keepAlive` is for:
-`auto --keepalive` (wired to the per-prompt hook) refreshes every non-revoked
-account whose access token has lapsed, so a parked credential stays current and
-a dead grant surfaces then rather than at the swap that needed it.
+a local deadline refuse a refresh. An account nothing selects still has to be
+renewed — that is what `keepAlive` is for: `auto --keepalive` (wired to the
+per-prompt hook) refreshes every non-revoked account whose access token has
+lapsed, so a parked credential stays current and a dead grant surfaces then
+rather than at the swap that needed it.
 
 Accounts and API keys can be `Disabled`: still stored, still renewed, but out
 of every selection path. Reach them through `Store.EnabledAccounts` /
