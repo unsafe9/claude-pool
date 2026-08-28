@@ -121,6 +121,10 @@ Usage:
   claude-pool helper                  apiKeyHelper hook for cc (managed by auto)
   claude-pool status                  Active auth profile as JSON (no network):
                                       {mode,name[,resets_at,reset_in_seconds]}
+                                      plus the cached windows behind it:
+                                      {usage_at,five_hour,seven_day,scoped[]},
+                                      each {pct,resets_at,reset_in_seconds} and
+                                      scoped ones labelled by model (Fable)
   claude-pool version                 Print the build version
 
 Add accounts: log into cc with each account, then run `+"`import --id NAME`"+` each time.
@@ -867,6 +871,7 @@ func cmdAuto(args []string) error {
 		// point is to move off it, however much headroom it has left.
 		if cur := s.Find(s.Current); cur != nil && !cur.Disabled {
 			if u, err := usageFor(s, cur); err == nil {
+				cacheUsage(cur.ID, u)
 				if u.Score() < *threshold*100 {
 					return finish(nil)
 				}
@@ -1099,6 +1104,21 @@ func cacheUsages(s *pool.Store, usages []pool.Usage, errs []error) {
 	})
 }
 
+// cacheUsage persists one account's freshly-polled usage. The fast path polls
+// only the current account and returns before pollAccounts runs, so without
+// this the cache — which `status` serves to statuslines — would only refresh on
+// the comparatively rare full polls.
+func cacheUsage(id string, u pool.Usage) {
+	now := time.Now()
+	_, _ = pool.LockedUpdate(func(st *pool.Store) error {
+		if e := st.Find(id); e != nil {
+			e.Usage = &u
+			e.UsageAt = now
+		}
+		return nil
+	})
+}
+
 // usableAt is the moment u's exhausted windows have all reset — zero when the
 // account is not exhausted or a reset time is unknown.
 func usableAt(u pool.Usage) time.Time {
@@ -1263,20 +1283,55 @@ func onOff(b bool) string {
 	return "off"
 }
 
+// statusWindow is one rate-limit window as `status` reports it. It carries the
+// countdown pre-computed alongside the timestamp so a shell statusline never
+// has to parse RFC3339 — portable date math is the awkward part of rendering
+// one. Label names a model-scoped window ("Fable") and is empty otherwise.
+type statusWindow struct {
+	Label          string  `json:"label,omitempty"`
+	Pct            float64 `json:"pct"`
+	ResetsAt       string  `json:"resets_at"`
+	ResetInSeconds int64   `json:"reset_in_seconds"`
+}
+
+// mkStatusWindow renders w for `status`, or nil when its reset time is unknown
+// or already past. A lapsed window's cached percentage describes a quota that
+// has since refilled, which is worse than reporting nothing.
+func mkStatusWindow(w pool.Window, now time.Time) *statusWindow {
+	if w.ResetsAt.IsZero() || !now.Before(w.ResetsAt) {
+		return nil
+	}
+	return &statusWindow{
+		Label:          w.Label,
+		Pct:            w.Pct,
+		ResetsAt:       w.ResetsAt.Format(time.RFC3339),
+		ResetInSeconds: int64(w.ResetsAt.Sub(now).Seconds()),
+	}
+}
+
 // cmdStatus prints the active auth profile as JSON from the store alone, no
 // network — cheap enough for a statusline to call on every render. In API-key
 // mode it adds the soonest cached window reset so a statusline can show "back
 // to subscription in 40m"; a cold cache omits the reset fields.
+//
+// In account mode it also serves the current account's cached usage windows —
+// including the model-scoped ones (Fable's own weekly quota), which reach this
+// machine nowhere else: Claude Code's statusline payload carries only the
+// account-wide 5-hour and 7-day windows.
 func cmdStatus() error {
 	s, err := pool.Load()
 	if err != nil {
 		return err
 	}
 	out := struct {
-		Mode           string `json:"mode"`
-		Name           string `json:"name"`
-		ResetsAt       string `json:"resets_at,omitempty"`
-		ResetInSeconds *int64 `json:"reset_in_seconds,omitempty"`
+		Mode           string         `json:"mode"`
+		Name           string         `json:"name"`
+		ResetsAt       string         `json:"resets_at,omitempty"`
+		ResetInSeconds *int64         `json:"reset_in_seconds,omitempty"`
+		UsageAt        string         `json:"usage_at,omitempty"`
+		FiveHour       *statusWindow  `json:"five_hour,omitempty"`
+		SevenDay       *statusWindow  `json:"seven_day,omitempty"`
+		Scoped         []statusWindow `json:"scoped,omitempty"`
 	}{Mode: pool.ModeAccount, Name: s.Current}
 
 	if s.Mode == pool.ModeAPIKey {
@@ -1289,6 +1344,22 @@ func cmdStatus() error {
 			}
 			out.ResetsAt = t.Format(time.RFC3339)
 			out.ResetInSeconds = &secs
+		}
+		// No windows in API-key mode: billing is on a key, and "the current
+		// account" is whichever one auto picks on recovery, not s.Current. The
+		// aggregate reset above is the honest answer there.
+		return json.NewEncoder(os.Stdout).Encode(out)
+	}
+
+	now := time.Now()
+	if a := s.Find(s.Current); a != nil && a.Usage != nil {
+		out.UsageAt = a.UsageAt.Format(time.RFC3339)
+		out.FiveHour = mkStatusWindow(a.Usage.FiveHour, now)
+		out.SevenDay = mkStatusWindow(a.Usage.SevenDay, now)
+		for _, w := range a.Usage.Scoped {
+			if sw := mkStatusWindow(w, now); sw != nil {
+				out.Scoped = append(out.Scoped, *sw)
+			}
 		}
 	}
 	return json.NewEncoder(os.Stdout).Encode(out)

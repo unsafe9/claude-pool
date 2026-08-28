@@ -126,6 +126,17 @@ elif [ -n "$name" ]; then
 fi
 ```
 
+On an account, `status` also serves that account's cached windows: `"usage_at"` plus `"five_hour"`, `"seven_day"`, and a `"scoped"` array of the model-scoped ones, each `{"pct","resets_at","reset_in_seconds"}` and the scoped ones `"label"`-ed by model. The countdown comes pre-computed so a shell script never has to parse RFC3339, and a window whose reset has already passed is dropped rather than reported from a stale percentage.
+
+The scoped windows are the reason to read usage from here rather than from Claude Code: its statusline payload exposes only the account-wide 5-hour and 7-day windows, so Fable's own weekly quota reaches a statusline nowhere else.
+
+```sh
+# one line per scoped window — "Fable 97 171780" — to render as "F:97%/1d23h"
+printf '%s' "$json" | jq -r '.scoped[]? | "\(.label) \(.pct | floor) \(.reset_in_seconds)"'
+```
+
+The cache refreshes on every poll, including the per-prompt `auto --if-needed` fast path. A pool holding a single account and no keys is the exception: it has nothing to switch between, so it never polls, and `status` reports no windows.
+
 Manual swapping, for use outside the hooks:
 
 ```bash
