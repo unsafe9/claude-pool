@@ -63,7 +63,8 @@ claude-pool key add --id console2              # paste at the prompt (input hidd
 ## How it works
 
 - **Account mode** (the default, preferred state): the chosen account's OAuth credential is written into Claude Code's own credential store — the macOS Keychain item `Claude Code-credentials`, or `~/.claude/.credentials.json` on Linux/WSL/Windows (the same plaintext file Claude Code itself uses there). Expiring tokens are refreshed before use.
-- **Selection**: each account is scored by its *binding utilization* — the most-constrained rate-limit window from the subscription usage API (`/api/oauth/usage`). `auto` polls all accounts concurrently and activates the one with the lowest score.
+- **Selection**: each account is scored by its *binding utilization* — the most-constrained rate-limit window from the subscription usage API (`/api/oauth/usage`). `auto` polls all accounts concurrently. Of those under the swap threshold, it activates the one whose 7-day window resets soonest: quota left at a reset is gone, so the account about to reset has the most to lose by waiting, while one with days left keeps its headroom for later (ties go to the less-used one; a week that has not started ranks last). When every account is past the threshold, it takes the least used.
+- **Pinning**: `switch` pins the account it switches to. While the pin holds, every `auto` run keeps Claude Code on that account until it is actually exhausted, instead of swapping at the threshold. The pin lapses at the account's 7-day reset (or after `--for`, or 24 hours when the reset is unknown). It is also released when the account runs out, when a turn hits its rate limit, when anything moves cc to another account, or on `claude-pool unpin`.
 - **Rate-limit windows**: the account-wide 5-hour and 7-day windows, plus every model-scoped window the API reports (Fable, for instance, has its own weekly quota). A model-scoped window counts the same as an account-wide one, so an account with its Fable quota spent is treated as exhausted even while its overall quota still has headroom — that is what makes a Fable limit trigger a swap. `list` tags those windows with the model: `4%/4h40m 54%/1d23h Fable:97%/1d23h`. Opt out with `claude-pool config scoped-limits off` if you don't run the scoped model and would rather spend the account-wide quota — the tagged windows then disappear from `list` too, since the whole tool stops seeing them.
 - **API-key fallback**: accounts always win. Only when *every* successfully polled account sits at 100% does `auto` flip to API keys, by setting `apiKeyHelper` in `~/.claude/settings.json` — `apiKeyHelper` outranks the stored OAuth credential in Claude Code's documented [authentication precedence](https://code.claude.com/docs/en/authentication.md#authentication-precedence), and settings changes hot-reload into running sessions. The helper round-robins across registered keys on each invocation.
 - **Recovery**: API-key time is billed time, so leaving it is aggressive. Three triggers race to get you back on subscription auth the moment any account resets below 100%:
@@ -99,7 +100,10 @@ The hooks drive everything through `claude-pool auto`; the same binary doubles a
 
 ```bash
 claude-pool list           # accounts with live usage per window, then keys
-claude-pool switch work    # switch to a specific account
+claude-pool switch work    # switch to a specific account and pin it there
+claude-pool switch --for 3h work   # pin for a set time instead of until its weekly reset
+claude-pool switch --no-pin work   # switch without pinning; auto may move off it
+claude-pool unpin          # release the pin; auto chooses again
 claude-pool disable work   # keep the account, hold it out of rotation
 claude-pool enable work    # put it back
 claude-pool rm console1    # remove an account or API key
@@ -112,7 +116,7 @@ claude-pool version        # build version
 
 `disable` is `rm` without the loss: the entry stays in the pool, and a disabled account's credential is still renewed, so putting it back needs nothing else. Nothing selects, polls or scores a disabled entry — `list` shows it as `disabled`, and disabling the account Claude Code is currently on (or the key it is billing) swaps immediately to whatever is left, down to falling back to API keys. Re-importing an account or re-adding a key puts it back in rotation.
 
-`status` is network-free, so a custom statusline script can call it on every render. It prints `{"mode","name"}` — `mode` is `account` or `apikey`, `name` is the active account or key id — and in API-key mode adds `"resets_at"` and `"reset_in_seconds"`: how long until an account is expected to free up and subscription auth resumes (read from the usage cache, omitted when unknown). For example, in a Claude Code [statusLine](https://code.claude.com/docs/en/statusline.md) script — a gray `[work]` on subscription, a red `[key:console2 40m]` billing warning while on an API key:
+`status` is network-free, so a custom statusline script can call it on every render. It prints `{"mode","name"}` — `mode` is `account` or `apikey`, `name` is the active account or key id, plus `"pinned_until"` while a `switch` pin holds — and in API-key mode adds `"resets_at"` and `"reset_in_seconds"`: how long until an account is expected to free up and subscription auth resumes (read from the usage cache, omitted when unknown). For example, in a Claude Code [statusLine](https://code.claude.com/docs/en/statusline.md) script — a gray `[work]` on subscription, a red `[key:console2 40m]` billing warning while on an API key:
 
 ```sh
 json=$(claude-pool status 2>/dev/null)
@@ -140,7 +144,7 @@ The cache refreshes on every poll, including the per-prompt `auto --if-needed` f
 Manual swapping, for use outside the hooks:
 
 ```bash
-claude-pool auto                               # pick the least-used account / fall back / recover
+claude-pool auto                               # pick an account / fall back / recover
 claude-pool auto --if-needed --threshold 0.9   # cheap path: poll only the current account,
                                                # act only if it is past 90% (default 0.8)
 claude-pool auto --launch -- --continue        # switch, then exec `claude --continue`

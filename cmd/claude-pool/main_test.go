@@ -120,3 +120,40 @@ func TestIsOurHelper(t *testing.T) {
 		t.Error("windows double-quoted claude-pool.exe helper should match")
 	}
 }
+
+func TestBestAccount(t *testing.T) {
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	use := func(pct float64, weekResetIn time.Duration) pool.Usage {
+		u := pool.Usage{FiveHour: pool.Window{Pct: pct, ResetsAt: now.Add(time.Hour)}}
+		if weekResetIn > 0 {
+			u.SevenDay = pool.Window{Pct: pct, ResetsAt: now.Add(weekResetIn)}
+		}
+		return u
+	}
+	day := 24 * time.Hour
+
+	for _, tc := range []struct {
+		name   string
+		usages []pool.Usage
+		want   string
+	}{
+		// The account about to forfeit its quota goes first, used or not.
+		{"soonest reset under ceiling", []pool.Usage{use(10, 6*day), use(60, day), use(30, 3*day)}, "b"},
+		// Past the ceiling it is not a candidate, however soon it resets.
+		{"over ceiling skipped", []pool.Usage{use(10, 6*day), use(85, day), use(30, 3*day)}, "c"},
+		// A week that has not started has nothing at risk.
+		{"unknown reset last", []pool.Usage{use(10, 0), use(60, 5*day), use(30, 0)}, "b"},
+		{"tie to lower use", []pool.Usage{use(50, day), use(20, day), use(70, day)}, "b"},
+		// Nothing under the ceiling: least used, so API-key fallback still reads
+		// "is anything usable at all" off the score.
+		{"all over ceiling", []pool.Usage{use(95, day), use(85, 6*day), use(99, 2*day)}, "b"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &pool.Store{Accounts: []*pool.Account{{ID: "a"}, {ID: "b"}, {ID: "c"}}}
+			best, _, polled := bestAccount(s, tc.usages, make([]error, 3), 80)
+			if best == nil || best.ID != tc.want || polled != 3 {
+				t.Errorf("best = %v (polled %d), want %s", best, polled, tc.want)
+			}
+		})
+	}
+}

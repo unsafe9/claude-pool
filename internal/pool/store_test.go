@@ -210,3 +210,45 @@ func TestLoad_IgnoreScopedLimitsStripsCachedUsage(t *testing.T) {
 		t.Errorf("opted-out Score = %v, want 54 (account-wide windows only)", score)
 	}
 }
+
+// A pin holds cc on one account only while that account is what cc runs on; a
+// swap away must drop it, or a later swap landing back there would revive it.
+func TestStore_PinLifecycle(t *testing.T) {
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	pinned := func() *Store {
+		s := &Store{Accounts: []*Account{{ID: "a"}, {ID: "b"}}}
+		s.SetCurrent("a")
+		s.PinnedID, s.PinnedUntil = "a", now.Add(time.Hour)
+		return s
+	}
+
+	if s := pinned(); s.PinnedAccount(now) == nil {
+		t.Fatal("fresh pin not in force")
+	}
+	if s := pinned(); s.PinnedAccount(now.Add(time.Hour)) != nil {
+		t.Error("pin in force past its deadline")
+	}
+	s := pinned()
+	s.Mode = ModeAPIKey
+	if s.PinnedAccount(now) != nil {
+		t.Error("pin in force in API-key mode")
+	}
+
+	s = pinned()
+	s.SetCurrent("a") // re-selecting the pinned account keeps the pin
+	if s.PinnedAccount(now) == nil {
+		t.Error("SetCurrent on the pinned account dropped the pin")
+	}
+	s.SetCurrent("b")
+	s.SetCurrent("a")
+	if s.PinnedAccount(now) != nil {
+		t.Error("pin revived after a swap away and back")
+	}
+
+	s = pinned()
+	s.SetDisabled("a", true)
+	s.SetDisabled("a", false)
+	if s.PinnedAccount(now) != nil {
+		t.Error("pin revived after disable/enable")
+	}
+}

@@ -44,6 +44,14 @@ of every selection path. Reach them through `Store.EnabledAccounts` /
 `Store.EnabledKeys` rather than iterating the raw slices, or a disabled entry
 gets polled, scored or served.
 
+A manual `switch` pins its account (`Store.PinnedID`/`PinnedUntil`): every
+`auto` keeps cc on it until it is exhausted instead of swapping at the
+threshold. Move the active account through `Store.SetCurrent`, never by
+assigning `Current`, so a swap away drops the pin rather than leaving it to
+revive when a later swap lands back on that account. `auto` polls for seconds
+before it swaps, so its swaps are guarded on the selection it started from
+(`guardSelection`) and yield to a `switch` that landed meanwhile.
+
 Tests must never reach the token endpoint — a refresh there consumes a real
 token. Point `oauthTokenURL` at an `httptest` server instead.
 

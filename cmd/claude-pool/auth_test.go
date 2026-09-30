@@ -176,7 +176,7 @@ func TestPollAccounts_SkipsDisabled(t *testing.T) {
 	if errs[1] == nil || errors.Is(errs[1], errDisabled) {
 		t.Errorf("errs[broken] = %v, want a poll failure", errs[1])
 	}
-	if best, _, polled := bestAccount(s, usages, errs); best != nil || polled != 0 {
+	if best, _, polled := bestAccount(s, usages, errs, 80); best != nil || polled != 0 {
 		t.Errorf("bestAccount = (%v, polled=%d), want nothing selectable", best, polled)
 	}
 }

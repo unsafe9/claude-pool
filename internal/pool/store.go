@@ -60,6 +60,12 @@ type Store struct {
 	Mode string `json:"mode,omitempty"`
 	// Current is the account ID last written to the Keychain.
 	Current string `json:"current,omitempty"`
+	// PinnedID and PinnedUntil record a manual `switch`: until PinnedUntil, the
+	// swap logic keeps Current on PinnedID for as long as it has any headroom,
+	// rather than moving off at the usual threshold. Moving Current to another
+	// account drops the pin — see SetCurrent.
+	PinnedID    string    `json:"pinned_id,omitempty"`
+	PinnedUntil time.Time `json:"pinned_until,omitempty"`
 	// CurrentKey and KeyCursor hold the round-robin position over APIKeys.
 	CurrentKey string `json:"current_key,omitempty"`
 	KeyCursor  int    `json:"key_cursor,omitempty"`
@@ -186,6 +192,35 @@ func (s *Store) Upsert(a *Account) {
 	s.Accounts = append(s.Accounts, a)
 }
 
+// SetCurrent points Current at id. A pin on any other account is dropped, so a
+// pin never outlives the swap away from it and revives when a later swap
+// happens to land back on that account.
+func (s *Store) SetCurrent(id string) {
+	if s.PinnedID != id {
+		s.ClearPin()
+	}
+	s.Current = id
+}
+
+// ClearPin drops any manual pin, handing selection back to auto.
+func (s *Store) ClearPin() {
+	s.PinnedID, s.PinnedUntil = "", time.Time{}
+}
+
+// PinnedAccount returns the account a manual pin is holding cc on at now, or
+// nil when there is no pin in force: none set, expired, not the live account,
+// or the account can no longer be served (disabled, dead grant, API-key mode).
+func (s *Store) PinnedAccount(now time.Time) *Account {
+	if s.PinnedID == "" || s.Mode == ModeAPIKey || s.Current != s.PinnedID || !now.Before(s.PinnedUntil) {
+		return nil
+	}
+	a := s.Find(s.PinnedID)
+	if a == nil || a.Disabled || a.Revoked() {
+		return nil
+	}
+	return a
+}
+
 // EnabledAccounts is the accounts eligible for selection — every path that
 // picks, polls or counts accounts for a swap decision goes through it, so a
 // disabled one is invisible to all of them.
@@ -217,6 +252,9 @@ func (s *Store) SetDisabled(id string, disabled bool) (kind string, changed bool
 	if a := s.Find(id); a != nil {
 		changed = a.Disabled != disabled
 		a.Disabled = disabled
+		if disabled && s.PinnedID == id {
+			s.ClearPin()
+		}
 		return "account", changed
 	}
 	if k := s.FindKey(id); k != nil {
@@ -256,6 +294,9 @@ func (s *Store) Remove(id string) bool {
 			s.Accounts = append(s.Accounts[:i], s.Accounts[i+1:]...)
 			if s.Current == id {
 				s.Current = ""
+			}
+			if s.PinnedID == id {
+				s.ClearPin()
 			}
 			return true
 		}

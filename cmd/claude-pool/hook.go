@@ -42,6 +42,11 @@ func cmdHook(args []string) (err error) {
 		_ = spawnDetached("auto", "--if-needed", "--threshold", "0.9", "--keepalive")
 		return nil
 	case "stop-failure":
+		// A rate-limited turn is a pinned account run down: the pin's work is
+		// done, and it must not hold cc on the account that just failed.
+		if id, err := releasePin(); err == nil && id != "" {
+			fmt.Fprintf(os.Stderr, "claude-pool: pinned account %q hit its rate limit; unpinned\n", id)
+		}
 		return cmdAuto(nil)
 	default:
 		return nil // unknown event → silent no-op

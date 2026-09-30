@@ -53,6 +53,8 @@ func main() {
 		err = cmdList(os.Args[2:])
 	case "switch":
 		err = cmdSwitch(os.Args[2:])
+	case "unpin":
+		err = cmdUnpin()
 	case "auto":
 		err = cmdAuto(os.Args[2:])
 	case "hook":
@@ -102,13 +104,23 @@ Usage:
   claude-pool enable <id>             Put it back in rotation
   claude-pool list [--json]           Show accounts (with 5h/7d usage) and keys;
                                       --json dumps pool state (no network/secrets)
-  claude-pool switch <id>             Switch to a specific account
+  claude-pool switch [flags] <id>     Switch to a specific account and pin it:
+                                      auto keeps cc on it until it runs out,
+                                      rather than at the usual threshold
+        --for DURATION      Pin length (default: until its 7-day window
+                            resets, or 24h when that is unknown)
+        --no-pin            Switch without pinning; auto may move off it
+  claude-pool unpin                   Release a pin; auto resumes choosing
   claude-pool auto [flags] [-- cc-args]
-                                      Pick the least-used account; if every
-                                      account is exhausted, fall back to API
-                                      keys until one resets
+                                      Pick an account (of those under
+                                      --threshold, the one whose 7-day window
+                                      resets soonest; else the least used); if
+                                      every account is exhausted, fall back to
+                                      API keys until one resets. A pinned
+                                      account is kept while it has headroom
         --if-needed         Only act if the current account is over --threshold
-        --threshold 0.0-1.0 Binding-utilization trigger for --if-needed (default 0.8)
+        --threshold 0.0-1.0 Swap trigger for --if-needed, and the ceiling an
+                            account must be under to be preferred (default 0.8)
         --keepalive         Also renew idle accounts, so a parked credential
                             stays current and a dead grant surfaces early
                             (the per-prompt hook passes this)
@@ -121,6 +133,7 @@ Usage:
   claude-pool helper                  apiKeyHelper hook for cc (managed by auto)
   claude-pool status                  Active auth profile as JSON (no network):
                                       {mode,name[,resets_at,reset_in_seconds]}
+                                      [,pinned_until] while a switch is pinned
                                       plus the cached windows behind it:
                                       {usage_at,five_hour,seven_day,scoped[]},
                                       each {pct,resets_at,reset_in_seconds} and
@@ -369,13 +382,13 @@ func harvest(s *pool.Store) {
 			// is left on a retired token. Only the pointer is withheld: the
 			// account is out of rotation, so the next auto moves cc off it.
 			if st.Mode != pool.ModeAPIKey && !a.Disabled {
-				st.Current = a.ID
+				st.SetCurrent(a.ID)
 			}
 			return nil
 		})
 		a.Blob, a.AuthError = kc, ""
 		if s.Mode != pool.ModeAPIKey && !a.Disabled {
-			s.Current = a.ID
+			s.SetCurrent(a.ID)
 		}
 	}
 	for _, a := range s.Accounts {
@@ -465,7 +478,7 @@ func cmdImport(args []string) error {
 	}
 	// The just-logged-in account is what the user wants active; this also leaves
 	// apikey mode.
-	if err := useAccount(s, s.Find(name)); err != nil {
+	if err := useAccount(s, s.Find(name), nil); err != nil {
 		return err
 	}
 	fmt.Printf("imported current account as %q (%d total)\n", name, len(s.Accounts))
@@ -586,7 +599,7 @@ func cmdRemove(args []string) error {
 		}
 		if enabled := s.EnabledAccounts(); len(enabled) > 0 {
 			a := enabled[0]
-			if err := useAccount(s, a); err != nil {
+			if err := useAccount(s, a, nil); err != nil {
 				return err
 			}
 			fmt.Fprintf(os.Stderr, "claude-pool: removed the active account; switched to %q\n", a.ID)
@@ -662,11 +675,12 @@ func cmdList(args []string) error {
 			Disabled bool   `json:"disabled,omitempty"`
 		}
 		out := struct {
-			Mode       string  `json:"mode"`
-			Current    string  `json:"current"`
-			CurrentKey string  `json:"current_key,omitempty"`
-			Accounts   []entry `json:"accounts"`
-			APIKeys    []entry `json:"api_keys"`
+			Mode        string     `json:"mode"`
+			Current     string     `json:"current"`
+			CurrentKey  string     `json:"current_key,omitempty"`
+			PinnedUntil *time.Time `json:"pinned_until,omitempty"`
+			Accounts    []entry    `json:"accounts"`
+			APIKeys     []entry    `json:"api_keys"`
 		}{
 			Mode:       s.Mode,
 			Current:    s.Current,
@@ -676,6 +690,9 @@ func cmdList(args []string) error {
 		}
 		if out.Mode == "" {
 			out.Mode = pool.ModeAccount
+		}
+		if s.PinnedAccount(time.Now()) != nil {
+			out.PinnedUntil = &s.PinnedUntil
 		}
 		for _, a := range s.Accounts {
 			out.Accounts = append(out.Accounts, entry{ID: a.ID, Email: a.Email, Disabled: a.Disabled})
@@ -719,9 +736,9 @@ func cmdList(args []string) error {
 			needLogin = append(needLogin, a.ID)
 			fmt.Printf("%s%-16s  re-login required (%s)\n", marker, a.ID, a.AuthError)
 		case errs[i] != nil:
-			fmt.Printf("%s%-16s  (error: %v)\n", marker, a.ID, errs[i])
+			fmt.Printf("%s%-16s  (error: %v)%s\n", marker, a.ID, errs[i], pinNote(s, a, now))
 		default:
-			fmt.Printf("%s%-16s  %s%s\n", marker, a.ID, usages[i].FormatStatusline(now), grantNote(a, now))
+			fmt.Printf("%s%-16s  %s%s%s\n", marker, a.ID, usages[i].FormatStatusline(now), pinNote(s, a, now), grantNote(a, now))
 		}
 	}
 	for _, k := range s.APIKeys {
@@ -742,6 +759,15 @@ func cmdList(args []string) error {
 		}
 	}
 	return nil
+}
+
+// pinNote marks the account a manual pin is holding cc on, as a suffix for the
+// list line.
+func pinNote(s *pool.Store, a *pool.Account, now time.Time) string {
+	if p := s.PinnedAccount(now); p == nil || p.ID != a.ID {
+		return ""
+	}
+	return "  pinned " + pool.ShortDur(s.PinnedUntil.Sub(now))
 }
 
 // grantWarnWindow is how long before a login lapses that `list` starts saying
@@ -769,11 +795,26 @@ func grantNote(a *pool.Account, now time.Time) string {
 	return ""
 }
 
+// defaultPinTTL bounds a pin whose account reports no 7-day reset — its week
+// has not started, or the poll failed — so it cannot hold indefinitely.
+const defaultPinTTL = 24 * time.Hour
+
+// cmdSwitch makes an account active by hand, and by default pins it. Without the
+// pin the choice would not last: the per-prompt hook swaps off anything past its
+// threshold, and every full `auto` re-picks from scratch — and the usual reason
+// to switch by hand is to spend an account that is already well used before its
+// week resets and the quota left in it is gone.
 func cmdSwitch(args []string) error {
-	if len(args) < 1 {
-		return fmt.Errorf("usage: claude-pool switch <id>")
+	fs := newFlagSet("switch")
+	pinFor := fs.Duration("for", 0, "pin length (default: until the account's 7-day window resets)")
+	noPin := fs.Bool("no-pin", false, "switch without pinning")
+	if err := fs.Parse(args); err != nil {
+		return err
 	}
-	id := args[0]
+	if fs.NArg() != 1 {
+		return fmt.Errorf("usage: claude-pool switch [--for DURATION | --no-pin] <id>")
+	}
+	id := fs.Arg(0)
 	s, err := loadPool()
 	if err != nil {
 		return err
@@ -788,18 +829,87 @@ func cmdSwitch(args []string) error {
 	if _, err := ensureFresh(a); err != nil {
 		return err
 	}
-	if err := useAccount(s, a); err != nil {
+
+	now := time.Now()
+	var pinUntil time.Time
+	if !*noPin {
+		// Best-effort: a failed poll still switches, on the fallback pin length.
+		u, uerr := usageFor(s, a)
+		if uerr == nil {
+			cacheUsage(a.ID, u)
+			if at := usableAt(u); !at.IsZero() {
+				fmt.Fprintf(os.Stderr, "note: %q is exhausted for another %s; auto will move off it at the next hook\n",
+					id, pool.ShortDur(at.Sub(now)))
+			}
+		}
+		pinUntil = pinDeadline(u, uerr, now, *pinFor)
+	}
+
+	if err := useAccount(s, a, func(st *pool.Store) error {
+		if pinUntil.IsZero() {
+			st.ClearPin()
+		} else {
+			st.PinnedID, st.PinnedUntil = a.ID, pinUntil
+		}
+		return nil
+	}); err != nil {
 		return err
 	}
-	fmt.Printf("switched to %q\n", id)
+	if pinUntil.IsZero() {
+		fmt.Printf("switched to %q\n", id)
+	} else {
+		fmt.Printf("switched to %q, pinned for %s (until it runs out; `claude-pool unpin` to release)\n",
+			id, pool.ShortDur(pinUntil.Sub(now)))
+	}
 	warnRunning()
 	return nil
+}
+
+// pinDeadline is when a pin taken at now lapses: an explicit length wins,
+// otherwise the account's 7-day reset — past it the quota being spent down has
+// refilled and there is nothing left to hurry — and defaultPinTTL when that is
+// unknown.
+func pinDeadline(u pool.Usage, uerr error, now time.Time, explicit time.Duration) time.Time {
+	if explicit > 0 {
+		return now.Add(explicit)
+	}
+	if uerr == nil && now.Before(u.SevenDay.ResetsAt) {
+		return u.SevenDay.ResetsAt
+	}
+	return now.Add(defaultPinTTL)
+}
+
+func cmdUnpin() error {
+	id, err := releasePin()
+	if err != nil {
+		return err
+	}
+	if id == "" {
+		fmt.Println("nothing pinned")
+		return nil
+	}
+	fmt.Printf("unpinned %q; auto chooses again from the next hook\n", id)
+	return nil
+}
+
+// releasePin drops any pin and reports the account it held, or "" when there
+// was none in force.
+func releasePin() (string, error) {
+	var id string
+	_, err := pool.LockedUpdate(func(st *pool.Store) error {
+		if a := st.PinnedAccount(time.Now()); a != nil {
+			id = a.ID
+		}
+		st.ClearPin()
+		return nil
+	})
+	return id, err
 }
 
 func cmdAuto(args []string) error {
 	fs := newFlagSet("auto")
 	ifNeeded := fs.Bool("if-needed", false, "only act if the current account is over --threshold")
-	threshold := fs.Float64("threshold", 0.8, "binding-utilization trigger for --if-needed (0.0-1.0)")
+	threshold := fs.Float64("threshold", 0.8, "swap trigger for --if-needed, and the ceiling for a preferred pick (0.0-1.0)")
 	keepalive := fs.Bool("keepalive", false, "also renew idle accounts, so parked credentials stay current")
 	launch := fs.Bool("launch", false, "exec `claude` after switching")
 	if err := fs.Parse(args); err != nil {
@@ -820,6 +930,10 @@ func cmdAuto(args []string) error {
 	// — including the fast path, which is where an idle account otherwise never
 	// gets touched — but never delays the swap decision it follows.
 	finish := func(err error) error {
+		if errors.Is(err, errSuperseded) {
+			fmt.Fprintln(os.Stderr, "claude-pool:", err)
+			err = nil
+		}
 		if *keepalive {
 			keepAlive(s)
 		}
@@ -840,6 +954,12 @@ func cmdAuto(args []string) error {
 	// runs over what the user left in rotation.
 	accounts, keys := s.EnabledAccounts(), s.EnabledKeys()
 
+	// Taken after reconcile, whose demote may already have moved the store on.
+	// Every swap below is conditional on it: this run polls for seconds, and a
+	// `switch` or another auto landing meanwhile must win over a decision made
+	// from what the store said before it.
+	guard := guardSelection(selectionOf(s))
+
 	// Nothing in rotation: no-op, silent enough for a global hook. cc keeps the
 	// credential it holds.
 	if len(accounts) == 0 && len(keys) == 0 {
@@ -848,7 +968,7 @@ func cmdAuto(args []string) error {
 	// Keys-only pool: nothing to prefer, go straight to the keys.
 	if len(accounts) == 0 {
 		if s.Mode != pool.ModeAPIKey {
-			return finish(enterAPIKeyMode(s))
+			return finish(enterAPIKeyMode(s, guard))
 		}
 		return finish(nil)
 	}
@@ -862,11 +982,31 @@ func cmdAuto(args []string) error {
 		return finish(nil)
 	}
 
-	// --if-needed fast path (the per-prompt hook): poll only the current account
-	// and stay put while it is under threshold. apikey mode gets no fast path —
-	// returning to an account the moment one resets requires polling them all.
 	var curUsage *pool.Usage
-	if *ifNeeded && s.Mode != pool.ModeAPIKey {
+	if p := s.PinnedAccount(now); p != nil {
+		// A pin holds while its account has any headroom at all, not just below
+		// the threshold — running it down is what it was pinned for. Every mode
+		// of auto honours it, so it survives the hooks until the account is out.
+		u, err := usageFor(s, p)
+		switch {
+		case err == nil:
+			cacheUsage(p.ID, u)
+			if u.Score() < 100 {
+				return finish(nil)
+			}
+			fmt.Fprintf(os.Stderr, "claude-pool: pinned account %q is exhausted; moving off it\n", p.ID)
+			curUsage = &u
+		// No information is no reason to abandon a pin; a grant that just died
+		// is, and the full pick below routes around it.
+		case !p.Revoked():
+			return finish(nil)
+		}
+	} else if *ifNeeded && s.Mode != pool.ModeAPIKey {
+		// --if-needed fast path (the per-prompt hook): poll only the current
+		// account and stay put while it is under threshold. apikey mode gets no
+		// fast path — returning to an account the moment one resets requires
+		// polling them all.
+		//
 		// A current account that has since been disabled gets no fast path: the
 		// point is to move off it, however much headroom it has left.
 		if cur := s.Find(s.Current); cur != nil && !cur.Disabled {
@@ -899,7 +1039,7 @@ func cmdAuto(args []string) error {
 
 	usages, errs := pollAccounts(s, curUsage)
 	cacheUsages(s, usages, errs)
-	best, bestScore, polled := bestAccount(s, usages, errs)
+	best, bestScore, polled := bestAccount(s, usages, errs, *threshold*100)
 
 	switch {
 	// A standing verdict, unlike an unreachable poll: the accounts will never
@@ -907,7 +1047,7 @@ func cmdAuto(args []string) error {
 	case allAuthFailed(s):
 		fmt.Fprintln(os.Stderr, "claude-pool: every account needs re-login (see `claude-pool list`)")
 		if len(s.APIKeys) > 0 && s.Mode != pool.ModeAPIKey {
-			return finish(enterAPIKeyMode(s))
+			return finish(enterAPIKeyMode(s, guard))
 		}
 		return finish(nil)
 
@@ -921,7 +1061,7 @@ func cmdAuto(args []string) error {
 	// accounts always win over API keys.
 	case bestScore < 100:
 		prev, prevMode := s.Current, s.Mode
-		if err := useAccount(s, best); err != nil {
+		if err := useAccount(s, best, guard); err != nil {
 			return finish(err)
 		}
 		if prevMode == pool.ModeAPIKey {
@@ -936,7 +1076,7 @@ func cmdAuto(args []string) error {
 	case len(s.APIKeys) > 0:
 		if s.Mode != pool.ModeAPIKey {
 			fmt.Fprintln(os.Stderr, "claude-pool: every account is exhausted")
-			if err := enterAPIKeyMode(s); err != nil {
+			if err := enterAPIKeyMode(s, guard); err != nil {
 				return finish(err)
 			}
 			// API-key time is billed time: arrange to leave it the moment the
@@ -1001,18 +1141,80 @@ func allAuthFailed(s *pool.Store) bool {
 	return true
 }
 
-func bestAccount(s *pool.Store, usages []pool.Usage, errs []error) (best *pool.Account, bestScore float64, polled int) {
+// bestAccount picks the account to run on from a poll. Of the accounts under
+// ceiling (0..100), it takes the one whose 7-day window resets soonest: quota
+// left unspent at a reset is forfeited, so the account about to reset loses the
+// most by waiting, while one with days left keeps its headroom for later. The
+// 5-hour window refills too often to rank by, and ties go to the lower
+// utilization. With nothing under the ceiling it falls back to the lowest
+// utilization, which the API-key fallback reads as "is anything usable at all".
+func bestAccount(s *pool.Store, usages []pool.Usage, errs []error, ceiling float64) (best *pool.Account, bestScore float64, polled int) {
 	bestScore = math.Inf(1)
+	var pick *pool.Account
+	var pickScore float64
+	var pickReset time.Time
 	for i, a := range s.Accounts {
 		if errs[i] != nil {
 			continue
 		}
 		polled++
-		if sc := usages[i].Score(); sc < bestScore {
+		sc := usages[i].Score()
+		if sc < bestScore {
 			best, bestScore = a, sc
 		}
+		if sc >= ceiling {
+			continue
+		}
+		if r := usages[i].SevenDay.ResetsAt; pick == nil || resetsSooner(r, pickReset) ||
+			(r.Equal(pickReset) && sc < pickScore) {
+			pick, pickScore, pickReset = a, sc, r
+		}
+	}
+	if pick != nil {
+		return pick, pickScore, polled
 	}
 	return best, bestScore, polled
+}
+
+// resetsSooner orders reset times with an unknown one (a window that has not
+// started, so nothing in it is at risk) last.
+func resetsSooner(a, b time.Time) bool {
+	switch {
+	case a.IsZero():
+		return false
+	case b.IsZero():
+		return true
+	}
+	return a.Before(b)
+}
+
+// selection is the part of the store that says what cc runs on, compared
+// before a swap to tell whether anything else changed it in the meantime.
+type selection struct {
+	mode, current, pinned string
+	pinnedUntil           time.Time
+}
+
+func selectionOf(s *pool.Store) selection {
+	return selection{s.Mode, s.Current, s.PinnedID, s.PinnedUntil}
+}
+
+func (a selection) equal(b selection) bool {
+	return a.mode == b.mode && a.current == b.current && a.pinned == b.pinned &&
+		a.pinnedUntil.Equal(b.pinnedUntil)
+}
+
+var errSuperseded = errors.New("the active credential changed while this run was deciding; leaving it")
+
+// guardSelection aborts a swap, inside its locked update, when the store no
+// longer holds the selection the decision was made from.
+func guardSelection(base selection) func(*pool.Store) error {
+	return func(st *pool.Store) error {
+		if !selectionOf(st).equal(base) {
+			return errSuperseded
+		}
+		return nil
+	}
 }
 
 // scheduleRecoveryWake re-runs `auto` just after the earliest exhausted account
@@ -1141,16 +1343,24 @@ func usableAt(u pool.Usage) time.Time {
 // Keychain actually holds rather than trusting the stored Current pointer, and
 // leaves apikey mode (restoring any displaced foreign apiKeyHelper). The store
 // must already be harvested — see loadPool.
-func useAccount(s *pool.Store, a *pool.Account) error {
+//
+// within, when non-nil, runs first inside the same locked unit: a guard that
+// aborts the swap, or an edit that must land atomically with it.
+func useAccount(s *pool.Store, a *pool.Account, within func(*pool.Store) error) error {
 	kc, kcErr := pool.ReadCredential()
-	if s.Mode == pool.ModeAPIKey {
-		if err := pool.RestoreAPIKeyHelper(s.SavedHelper); err != nil {
-			return err
-		}
-	}
 	return s.Update(func(st *pool.Store) error {
+		if within != nil {
+			if err := within(st); err != nil {
+				return err
+			}
+		}
+		if st.Mode == pool.ModeAPIKey {
+			if err := pool.RestoreAPIKeyHelper(st.SavedHelper); err != nil {
+				return err
+			}
+		}
 		st.Mode = pool.ModeAccount
-		st.Current = a.ID
+		st.SetCurrent(a.ID)
 		st.SavedHelper = ""
 		if e := st.Find(a.ID); e != nil {
 			e.Blob = a.Blob
@@ -1167,8 +1377,9 @@ func useAccount(s *pool.Store, a *pool.Account) error {
 // enterAPIKeyMode flips auth to the registered API keys. The store is saved
 // BEFORE the settings write, so cc can never observe our helper while the
 // on-disk mode still says account (cmdHelper would refuse to serve). The key
-// announced is the one the first helper call will actually serve.
-func enterAPIKeyMode(s *pool.Store) error {
+// announced is the one the first helper call will actually serve. within is as
+// for useAccount.
+func enterAPIKeyMode(s *pool.Store, within func(*pool.Store) error) error {
 	next := s.PeekNextKey()
 	if next == nil {
 		return fmt.Errorf("no API keys in rotation")
@@ -1182,8 +1393,14 @@ func enterAPIKeyMode(s *pool.Store) error {
 		return err
 	}
 	if err := s.Update(func(st *pool.Store) error {
+		if within != nil {
+			if err := within(st); err != nil {
+				return err
+			}
+		}
 		st.Mode = pool.ModeAPIKey
 		st.CurrentKey = next.ID
+		st.ClearPin()
 		if prevHelper != "" && !isOurHelper(prevHelper) {
 			st.SavedHelper = prevHelper // foreign helper: preserve for restore
 		}
@@ -1328,6 +1545,7 @@ func cmdStatus() error {
 		Name           string         `json:"name"`
 		ResetsAt       string         `json:"resets_at,omitempty"`
 		ResetInSeconds *int64         `json:"reset_in_seconds,omitempty"`
+		PinnedUntil    string         `json:"pinned_until,omitempty"`
 		UsageAt        string         `json:"usage_at,omitempty"`
 		FiveHour       *statusWindow  `json:"five_hour,omitempty"`
 		SevenDay       *statusWindow  `json:"seven_day,omitempty"`
@@ -1352,6 +1570,9 @@ func cmdStatus() error {
 	}
 
 	now := time.Now()
+	if s.PinnedAccount(now) != nil {
+		out.PinnedUntil = s.PinnedUntil.Format(time.RFC3339)
+	}
 	if a := s.Find(s.Current); a != nil && a.Usage != nil {
 		out.UsageAt = a.UsageAt.Format(time.RFC3339)
 		out.FiveHour = mkStatusWindow(a.Usage.FiveHour, now)
