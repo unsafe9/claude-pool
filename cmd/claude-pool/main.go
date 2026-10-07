@@ -106,7 +106,7 @@ Usage:
                                       --json dumps pool state (no network/secrets)
   claude-pool switch [flags] <id>     Switch to a specific account and pin it:
                                       auto keeps cc on it until it runs out,
-                                      rather than at the usual threshold
+                                      even while another resets sooner
         --for DURATION      Pin length (default: until its 7-day window
                             resets, or 24h when that is unknown)
         --no-pin            Switch without pinning; auto may move off it
@@ -118,9 +118,11 @@ Usage:
                                       every account is exhausted, fall back to
                                       API keys until one resets. A pinned
                                       account is kept while it has headroom
-        --if-needed         Only act if the current account is over --threshold
+        --if-needed         Only act if the current account is over
+                            --threshold or another one's week resets sooner
         --threshold 0.0-1.0 Swap trigger for --if-needed, and the ceiling an
-                            account must be under to be preferred (default 0.8)
+                            account must be under to be preferred (default
+                            1.0: run each account out before moving on)
         --keepalive         Also renew idle accounts, so a parked credential
                             stays current and a dead grant surfaces early
                             (the per-prompt hook passes this)
@@ -166,7 +168,11 @@ func ensureFresh(a *pool.Account) (pool.OAuthData, error) {
 
 	load := func() (string, error) { return storedBlob(a) }
 	save := func(nb string) error { return persistRotation(a, nb) }
-	blob, err := pool.RefreshCredential(a.ID, load, save)
+	var blob string
+	err = pool.WithCCRefreshLock(func() (err error) {
+		blob, err = pool.RefreshCredential(a.ID, load, save)
+		return err
+	})
 	if err != nil {
 		if errors.Is(err, errRelogin) {
 			return pool.OAuthData{}, err
@@ -227,6 +233,14 @@ func storedBlob(a *pool.Account) (string, error) {
 		a.AuthError = e.AuthError
 		return "", reloginError(a.ID, e.AuthError)
 	}
+	// cc renews the credential it holds on its own, which retires the refresh
+	// token stored here; spending that one would read as a stolen-token replay.
+	// The next loadPool folds cc's rotation back in.
+	if cur.Mode != pool.ModeAPIKey && cur.Current == a.ID {
+		if kc, err := pool.ReadCredential(); err == nil && kc != "" && kc != e.Blob {
+			return "", fmt.Errorf("account %q: %w", a.ID, errLiveMoved)
+		}
+	}
 	return e.Blob, nil
 }
 
@@ -255,6 +269,9 @@ func persistRotation(a *pool.Account, nb string) error {
 // errRelogin marks the errors that only a fresh login can clear, so callers can
 // tell them apart from a refresh that merely failed.
 var errRelogin = errors.New("needs re-login")
+
+// errLiveMoved marks a live credential cc renewed after this process read it.
+var errLiveMoved = errors.New("renewed by Claude Code since it was read; picked up on the next run")
 
 func reloginError(id, cause string) error {
 	return fmt.Errorf("account %q %w: %s", id, errRelogin, cause)
@@ -355,13 +372,22 @@ func loadPool() (*pool.Store, error) {
 }
 
 // harvest folds a credential that cc itself refreshed (or a manual /login into
-// a known account) back into the pool.
+// a known account) back into the pool. While cc holds its refresh lock it is
+// mid-rotation, and the next harvest picks the result up.
+func harvest(s *pool.Store) {
+	_ = pool.WithCCRefreshLock(func() error {
+		harvestLocked(s)
+		return nil
+	})
+}
+
+// harvestLocked is harvest for a caller already holding cc's refresh lock.
 //
 // Attribution is by account email via the profile API, which needs a live access
 // token; a credential that expired in place is refreshed first. An
 // unattributable one is left untouched rather than guessed at, since
 // misattributing it would overwrite one account's credential with another's.
-func harvest(s *pool.Store) {
+func harvestLocked(s *pool.Store) {
 	if len(s.Accounts) == 0 {
 		return
 	}
@@ -427,8 +453,8 @@ func harvest(s *pool.Store) {
 // refreshCredentialStore renews cc's own credential when it has expired in
 // place, so harvest can identify it. The rotation goes straight back to the
 // credential store: the refresh retired the token cc was holding, and leaving
-// the old blob there would strand cc on a dead grant. Nothing can lock against
-// cc itself, but this serializes claude-pool's own processes.
+// the old blob there would strand cc on a dead grant. The caller holds cc's
+// refresh lock, so cc re-reads the rotation rather than replaying its token.
 func refreshCredentialStore(blob string) (string, error) {
 	return pool.RefreshCredential(pool.CredentialStoreLockID, func() (string, error) {
 		if cur, err := pool.ReadCredential(); err == nil && cur != "" {
@@ -800,10 +826,8 @@ func grantNote(a *pool.Account, now time.Time) string {
 const defaultPinTTL = 24 * time.Hour
 
 // cmdSwitch makes an account active by hand, and by default pins it. Without the
-// pin the choice would not last: the per-prompt hook swaps off anything past its
-// threshold, and every full `auto` re-picks from scratch — and the usual reason
-// to switch by hand is to spend an account that is already well used before its
-// week resets and the quota left in it is gone.
+// pin the choice would not last: the per-prompt hook moves cc to whichever
+// account's week resets soonest, and every full `auto` re-picks from scratch.
 func cmdSwitch(args []string) error {
 	fs := newFlagSet("switch")
 	pinFor := fs.Duration("for", 0, "pin length (default: until the account's 7-day window resets)")
@@ -908,8 +932,8 @@ func releasePin() (string, error) {
 
 func cmdAuto(args []string) error {
 	fs := newFlagSet("auto")
-	ifNeeded := fs.Bool("if-needed", false, "only act if the current account is over --threshold")
-	threshold := fs.Float64("threshold", 0.8, "swap trigger for --if-needed, and the ceiling for a preferred pick (0.0-1.0)")
+	ifNeeded := fs.Bool("if-needed", false, "only act if the current account is over --threshold or another resets sooner")
+	threshold := fs.Float64("threshold", 1.0, "swap trigger for --if-needed, and the ceiling for a preferred pick (0.0-1.0)")
 	keepalive := fs.Bool("keepalive", false, "also renew idle accounts, so parked credentials stay current")
 	launch := fs.Bool("launch", false, "exec `claude` after switching")
 	if err := fs.Parse(args); err != nil {
@@ -984,9 +1008,10 @@ func cmdAuto(args []string) error {
 
 	var curUsage *pool.Usage
 	if p := s.PinnedAccount(now); p != nil {
-		// A pin holds while its account has any headroom at all, not just below
-		// the threshold — running it down is what it was pinned for. Every mode
-		// of auto honours it, so it survives the hooks until the account is out.
+		// A pin holds while its account has any headroom at all, whatever the
+		// threshold or the other accounts' resets — running it down is what it was
+		// pinned for. Every mode of auto honours it, so it survives the hooks
+		// until the account is out.
 		u, err := usageFor(s, p)
 		switch {
 		case err == nil:
@@ -1003,16 +1028,17 @@ func cmdAuto(args []string) error {
 		}
 	} else if *ifNeeded && s.Mode != pool.ModeAPIKey {
 		// --if-needed fast path (the per-prompt hook): poll only the current
-		// account and stay put while it is under threshold. apikey mode gets no
-		// fast path — returning to an account the moment one resets requires
-		// polling them all.
+		// account and stay put while it is under threshold and no other account
+		// has a week ending sooner — the order bestAccount would pick in. apikey
+		// mode gets no fast path — returning to an account the moment one resets
+		// requires polling them all.
 		//
 		// A current account that has since been disabled gets no fast path: the
 		// point is to move off it, however much headroom it has left.
 		if cur := s.Find(s.Current); cur != nil && !cur.Disabled {
 			if u, err := usageFor(s, cur); err == nil {
 				cacheUsage(cur.ID, u)
-				if u.Score() < *threshold*100 {
+				if u.Score() < *threshold*100 && !soonerCandidate(s, cur, u, now, *threshold*100) {
 					return finish(nil)
 				}
 				curUsage = &u
@@ -1174,6 +1200,40 @@ func bestAccount(s *pool.Store, usages []pool.Usage, errs []error, ceiling float
 		return pick, pickScore, polled
 	}
 	return best, bestScore, polled
+}
+
+// soonerCandidate reports whether, going by the cached usage alone, some other
+// account would win bestAccount's pick over cur (a week resetting sooner, with
+// headroom under ceiling), so the fast path owes a full poll. A reset time holds
+// until the reset itself, which is what makes the cache good enough to order by;
+// an account never polled counts, so its first poll fills the cache in.
+func soonerCandidate(s *pool.Store, cur *pool.Account, u pool.Usage, now time.Time, ceiling float64) bool {
+	for _, a := range s.EnabledAccounts() {
+		if a == cur || a.Revoked() {
+			continue
+		}
+		if a.Usage == nil {
+			return true
+		}
+		if r := a.Usage.SevenDay.ResetsAt; now.Before(r) && resetsSooner(r, u.SevenDay.ResetsAt) &&
+			cachedScore(*a.Usage, now) < ceiling {
+			return true
+		}
+	}
+	return false
+}
+
+// cachedScore is Usage.Score as of now: a window whose reset has passed since
+// the poll counts as empty.
+func cachedScore(u pool.Usage, now time.Time) float64 {
+	score := 0.0
+	for _, w := range u.Windows() {
+		if !w.ResetsAt.IsZero() && !now.Before(w.ResetsAt) {
+			continue
+		}
+		score = math.Max(score, w.Pct)
+	}
+	return score
 }
 
 // resetsSooner orders reset times with an unknown one (a window that has not
@@ -1341,12 +1401,23 @@ func usableAt(u pool.Usage) time.Time {
 
 // useAccount makes a the active credential, reconciling against what the
 // Keychain actually holds rather than trusting the stored Current pointer, and
-// leaves apikey mode (restoring any displaced foreign apiKeyHelper). The store
-// must already be harvested — see loadPool.
+// leaves apikey mode (restoring any displaced foreign apiKeyHelper).
+//
+// It runs under cc's refresh lock and harvests again first: cc renews the
+// credential it holds whenever it needs to, and a rotation saved after
+// loadPool's harvest would otherwise be overwritten here and lost with the
+// grant behind it.
 //
 // within, when non-nil, runs first inside the same locked unit: a guard that
 // aborts the swap, or an edit that must land atomically with it.
 func useAccount(s *pool.Store, a *pool.Account, within func(*pool.Store) error) error {
+	return pool.WithCCRefreshLock(func() error {
+		harvestLocked(s)
+		return writeAccount(s, a, within)
+	})
+}
+
+func writeAccount(s *pool.Store, a *pool.Account, within func(*pool.Store) error) error {
 	kc, kcErr := pool.ReadCredential()
 	return s.Update(func(st *pool.Store) error {
 		if within != nil {

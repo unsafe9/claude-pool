@@ -39,7 +39,7 @@ func cmdHook(args []string) (err error) {
 		// Detached so a slow poll never freezes the session — which is also what
 		// makes this the one hook that can afford --keepalive, whose renewals run
 		// off cc's critical path entirely.
-		_ = spawnDetached("auto", "--if-needed", "--threshold", "0.9", "--keepalive")
+		_ = spawnDetached("auto", "--if-needed", "--keepalive")
 		return nil
 	case "stop-failure":
 		// A rate-limited turn is a pinned account run down: the pin's work is
@@ -81,7 +81,7 @@ func hookSessionStart() error {
 	}
 
 	// In-process is safe here: cmdAuto writes only to stderr.
-	return cmdAuto([]string{"--if-needed", "--threshold", "0.9"})
+	return cmdAuto([]string{"--if-needed"})
 }
 
 // pluginVersion reads the wanted version from the installed plugin manifest.

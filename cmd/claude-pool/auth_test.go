@@ -20,6 +20,10 @@ func withPoolStore(t *testing.T, accounts ...*pool.Account) {
 	prev := pool.StorePath
 	pool.StorePath = func() (string, error) { return path, nil }
 	t.Cleanup(func() { pool.StorePath = prev })
+	claudeDir := filepath.Join(t.TempDir(), ".claude")
+	prevDir := pool.ClaudeDir
+	pool.ClaudeDir = func() (string, error) { return claudeDir, nil }
+	t.Cleanup(func() { pool.ClaudeDir = prevDir })
 
 	if _, err := pool.LockedUpdate(func(st *pool.Store) error {
 		st.Accounts = accounts

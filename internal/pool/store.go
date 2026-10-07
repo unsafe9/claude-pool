@@ -62,7 +62,7 @@ type Store struct {
 	Current string `json:"current,omitempty"`
 	// PinnedID and PinnedUntil record a manual `switch`: until PinnedUntil, the
 	// swap logic keeps Current on PinnedID for as long as it has any headroom,
-	// rather than moving off at the usual threshold. Moving Current to another
+	// rather than moving to an account whose week resets sooner. Moving Current to another
 	// account drops the pin — see SetCurrent.
 	PinnedID    string    `json:"pinned_id,omitempty"`
 	PinnedUntil time.Time `json:"pinned_until,omitempty"`

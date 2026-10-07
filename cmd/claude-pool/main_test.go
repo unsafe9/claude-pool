@@ -157,3 +157,46 @@ func TestBestAccount(t *testing.T) {
 		})
 	}
 }
+
+// The fast path must hand over to a full poll exactly when bestAccount would
+// pick another account, judging from the cache alone.
+func TestSoonerCandidate(t *testing.T) {
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	day := 24 * time.Hour
+	week := func(resetIn time.Duration, pct float64) *pool.Usage {
+		return &pool.Usage{SevenDay: pool.Window{Pct: pct, ResetsAt: now.Add(resetIn)}}
+	}
+	cur := &pool.Account{ID: "cur"}
+	curUsage := *week(3*day, 10)
+
+	for _, tc := range []struct {
+		name  string
+		other *pool.Account
+		want  bool
+	}{
+		{"resets sooner", &pool.Account{Usage: week(day, 50)}, true},
+		{"resets later", &pool.Account{Usage: week(5*day, 0)}, false},
+		{"sooner but exhausted", &pool.Account{Usage: week(day, 100)}, false},
+		{"sooner, 5h spent until later", &pool.Account{Usage: &pool.Usage{
+			FiveHour: pool.Window{Pct: 100, ResetsAt: now.Add(time.Hour)},
+			SevenDay: pool.Window{Pct: 50, ResetsAt: now.Add(day)},
+		}}, false},
+		{"sooner, 5h spent but since reset", &pool.Account{Usage: &pool.Usage{
+			FiveHour: pool.Window{Pct: 100, ResetsAt: now.Add(-time.Minute)},
+			SevenDay: pool.Window{Pct: 50, ResetsAt: now.Add(day)},
+		}}, true},
+		// Its week rolled over since the poll; the new one has not started.
+		{"cached week already reset", &pool.Account{Usage: week(-time.Hour, 50)}, false},
+		{"never polled", &pool.Account{}, true},
+		{"disabled", &pool.Account{Usage: week(day, 0), Disabled: true}, false},
+		{"revoked", &pool.Account{Usage: week(day, 0), AuthError: "invalid_grant"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.other.ID = "other"
+			s := &pool.Store{Accounts: []*pool.Account{cur, tc.other}}
+			if got := soonerCandidate(s, cur, curUsage, now, 100); got != tc.want {
+				t.Errorf("soonerCandidate = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

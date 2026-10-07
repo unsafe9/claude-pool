@@ -22,10 +22,14 @@ token and cost the whole grant, permanently. `pool.RefreshCredential` is the
 only way to reach the token endpoint — it holds the credential's lock, re-reads
 the authoritative blob inside it, and persists the rotation — so renew through
 it and never add a second caller of the unexported `refresh`. The refresh lock
-is per-credential and separate from the store lock; order is refresh lock →
-store lock. Commands load through `loadPool`, which harvests the rotation
-Claude Code may have made to the active credential before anything reads or
-overwrites a stored blob. A grant the server has permanently rejected is
+is per-credential and separate from the store lock. cc renews the credential it
+holds on its own, under its own lock (`~/.claude/.oauth_refresh.lock`,
+`pool.WithCCRefreshLock`). `harvest`, `useAccount` and `ensureFresh` read,
+renew or overwrite that credential only under it; otherwise the two spend the
+same token, or a swap overwrites a rotation cc just saved. Order is cc lock →
+refresh lock → store lock. Commands load through `loadPool`, which harvests the
+rotation Claude Code may have made to the active credential before anything
+reads or overwrites a stored blob. A grant the server has permanently rejected is
 recorded in `Account.AuthError` and left alone until re-login, never retried.
 
 A login carries a deadline, recorded as `refreshTokenExpiresAt` in the blob.
@@ -44,9 +48,10 @@ of every selection path. Reach them through `Store.EnabledAccounts` /
 `Store.EnabledKeys` rather than iterating the raw slices, or a disabled entry
 gets polled, scored or served.
 
-A manual `switch` pins its account (`Store.PinnedID`/`PinnedUntil`): every
-`auto` keeps cc on it until it is exhausted instead of swapping at the
-threshold. Move the active account through `Store.SetCurrent`, never by
+`auto` runs the account whose 7-day window resets soonest until it is
+exhausted. A manual `switch` pins its account (`Store.PinnedID`/`PinnedUntil`):
+every `auto` keeps cc on it until it is exhausted, even while another account
+resets sooner. Move the active account through `Store.SetCurrent`, never by
 assigning `Current`, so a swap away drops the pin rather than leaving it to
 revive when a later swap lands back on that account. `auto` polls for seconds
 before it swaps, so its swaps are guarded on the selection it started from
