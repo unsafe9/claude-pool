@@ -25,15 +25,22 @@ type Window struct {
 // Usage is the rate-limit state for a subscription account: the account-wide
 // 5-hour and 7-day windows, plus any model-scoped windows (e.g. Fable's own
 // weekly quota), which exhaust independently of the account-wide ones.
+//
+// FiveHour is nil when the plan has no 5-hour window (Ultra reports five_hour
+// as null or leaves it out), so an absent window never reads as an empty one.
 type Usage struct {
-	FiveHour Window   `json:"five_hour"`
+	FiveHour *Window  `json:"five_hour,omitempty"`
 	SevenDay Window   `json:"seven_day"`
 	Scoped   []Window `json:"scoped,omitempty"`
 }
 
 // Windows is every window that can take the account offline.
 func (u Usage) Windows() []Window {
-	return append([]Window{u.FiveHour, u.SevenDay}, u.Scoped...)
+	ws := make([]Window, 0, 2+len(u.Scoped))
+	if u.FiveHour != nil {
+		ws = append(ws, *u.FiveHour)
+	}
+	return append(append(ws, u.SevenDay), u.Scoped...)
 }
 
 // WithoutScoped drops the model-scoped windows, leaving only the account-wide
@@ -92,7 +99,8 @@ func parseUsage(r io.Reader) (Usage, error) {
 
 	var u Usage
 	if raw.FiveHour != nil {
-		u.FiveHour = mkWindow(raw.FiveHour.Utilization, raw.FiveHour.ResetsAt)
+		w := mkWindow(raw.FiveHour.Utilization, raw.FiveHour.ResetsAt)
+		u.FiveHour = &w
 	}
 	if raw.SevenDay != nil {
 		u.SevenDay = mkWindow(raw.SevenDay.Utilization, raw.SevenDay.ResetsAt)
@@ -157,9 +165,14 @@ func mkWindow(util float64, resetsAt string) Window {
 // FormatStatusline renders the compact form "4%/4h40m 2%/6d8h": for each window
 // the floored utilization percent and the time until reset. Model-scoped
 // windows follow, tagged with their model — "4%/4h40m 2%/6d8h Fable:97%/1d23h".
+// A plan without a 5-hour window keeps the column, as "-".
 func (u Usage) FormatStatusline(now time.Time) string {
+	fiveHour := "-"
+	if w := u.FiveHour; w != nil {
+		fiveHour = fmt.Sprintf("%d%%/%s", int(math.Floor(w.Pct)), shortDur(w.ResetsAt.Sub(now), false))
+	}
 	parts := []string{
-		fmt.Sprintf("%d%%/%s", int(math.Floor(u.FiveHour.Pct)), shortDur(u.FiveHour.ResetsAt.Sub(now), false)),
+		fiveHour,
 		fmt.Sprintf("%d%%/%s", int(math.Floor(u.SevenDay.Pct)), shortDur(u.SevenDay.ResetsAt.Sub(now), true)),
 	}
 	for _, w := range u.Scoped {

@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -27,6 +28,20 @@ func TestParseBlob(t *testing.T) {
 	}
 	if od.SubscriptionType != "max" {
 		t.Errorf("SubscriptionType = %q", od.SubscriptionType)
+	}
+}
+
+// The top plan was renamed from Max to Ultra; credentials from either era load.
+func TestParseBlob_SubscriptionTypes(t *testing.T) {
+	for _, typ := range []string{"max", "ultra"} {
+		blob := strings.Replace(sampleBlob, `"subscriptionType":"max"`, `"subscriptionType":"`+typ+`"`, 1)
+		od, err := ParseBlob(blob)
+		if err != nil {
+			t.Fatalf("ParseBlob(%s): %v", typ, err)
+		}
+		if od.SubscriptionType != typ {
+			t.Errorf("SubscriptionType = %q, want %q", od.SubscriptionType, typ)
+		}
 	}
 }
 

@@ -174,7 +174,7 @@ func TestLoad_IgnoreScopedLimitsStripsCachedUsage(t *testing.T) {
 	path := withStorePath(t)
 
 	exhausted := Usage{
-		FiveHour: Window{Pct: 20},
+		FiveHour: &Window{Pct: 20},
 		SevenDay: Window{Pct: 54},
 		Scoped:   []Window{{Pct: 100, Label: "Fable", ResetsAt: time.Now().Add(48 * time.Hour)}},
 	}

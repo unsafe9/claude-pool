@@ -14,39 +14,94 @@ func TestUsableAt(t *testing.T) {
 
 	// Not exhausted → zero.
 	if got := usableAt(pool.Usage{
-		FiveHour: pool.Window{Pct: 80, ResetsAt: in1h},
+		FiveHour: &pool.Window{Pct: 80, ResetsAt: in1h},
 		SevenDay: pool.Window{Pct: 50, ResetsAt: in2h},
 	}); !got.IsZero() {
 		t.Errorf("non-exhausted usableAt = %v, want zero", got)
 	}
 	// Only 5h exhausted → its reset.
 	if got := usableAt(pool.Usage{
-		FiveHour: pool.Window{Pct: 100, ResetsAt: in1h},
+		FiveHour: &pool.Window{Pct: 100, ResetsAt: in1h},
 		SevenDay: pool.Window{Pct: 50, ResetsAt: in2h},
 	}); !got.Equal(in1h) {
 		t.Errorf("5h-bound usableAt = %v, want %v", got, in1h)
 	}
 	// Both exhausted → the later reset.
 	if got := usableAt(pool.Usage{
-		FiveHour: pool.Window{Pct: 100, ResetsAt: in1h},
+		FiveHour: &pool.Window{Pct: 100, ResetsAt: in1h},
 		SevenDay: pool.Window{Pct: 100, ResetsAt: in2h},
 	}); !got.Equal(in2h) {
 		t.Errorf("both-bound usableAt = %v, want %v", got, in2h)
 	}
 	// Exhausted window with unknown reset → zero (can't schedule).
 	if got := usableAt(pool.Usage{
-		FiveHour: pool.Window{Pct: 100},
+		FiveHour: &pool.Window{Pct: 100},
 		SevenDay: pool.Window{Pct: 50, ResetsAt: in2h},
 	}); !got.IsZero() {
 		t.Errorf("unknown-reset usableAt = %v, want zero", got)
 	}
 	// Only a model-scoped window exhausted → its reset.
 	if got := usableAt(pool.Usage{
-		FiveHour: pool.Window{Pct: 20, ResetsAt: in1h},
+		FiveHour: &pool.Window{Pct: 20, ResetsAt: in1h},
 		SevenDay: pool.Window{Pct: 50, ResetsAt: in1h},
 		Scoped:   []pool.Window{{Pct: 100, ResetsAt: in2h, Label: "Fable"}},
 	}); !got.Equal(in2h) {
 		t.Errorf("scoped-bound usableAt = %v, want %v", got, in2h)
+	}
+}
+
+// An Ultra account has no 5-hour window. It must rank by its 7-day and scoped
+// windows alongside accounts that still have one, which keep being held out
+// while their 5-hour window is spent.
+func TestBestAccount_UltraWithoutFiveHour(t *testing.T) {
+	now := time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
+	day := 24 * time.Hour
+	week := func(resetIn time.Duration, pct float64) pool.Window {
+		return pool.Window{Pct: pct, ResetsAt: now.Add(resetIn)}
+	}
+	fiveHourSpent := &pool.Window{Pct: 100, ResetsAt: now.Add(time.Hour)}
+	fiveHourFree := &pool.Window{Pct: 10, ResetsAt: now.Add(time.Hour)}
+
+	for _, tc := range []struct {
+		name   string
+		usages []pool.Usage // accounts "a" (Ultra) and "b" (with a 5h window)
+		want   string
+		score  float64
+	}{
+		{"ultra resets sooner", []pool.Usage{
+			{SevenDay: week(day, 60)},
+			{FiveHour: fiveHourFree, SevenDay: week(3*day, 20)},
+		}, "a", 60},
+		{"other resets sooner", []pool.Usage{
+			{SevenDay: week(3*day, 0)},
+			{FiveHour: fiveHourFree, SevenDay: week(day, 20)},
+		}, "b", 20},
+		{"other's 5h spent", []pool.Usage{
+			{SevenDay: week(3*day, 60)},
+			{FiveHour: fiveHourSpent, SevenDay: week(day, 20)},
+		}, "a", 60},
+		{"ultra's week spent", []pool.Usage{
+			{SevenDay: week(day, 100)},
+			{FiveHour: fiveHourFree, SevenDay: week(3*day, 20)},
+		}, "b", 20},
+		{"ultra's scoped window spent", []pool.Usage{
+			{SevenDay: week(day, 10), Scoped: []pool.Window{{Pct: 100, ResetsAt: now.Add(day), Label: "Fable"}}},
+			{FiveHour: fiveHourFree, SevenDay: week(3*day, 20)},
+		}, "b", 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &pool.Store{Accounts: []*pool.Account{{ID: "a"}, {ID: "b"}}}
+			got, score, polled := bestAccount(s, tc.usages, make([]error, 2), 100)
+			if got == nil || got.ID != tc.want || score != tc.score || polled != 2 {
+				t.Errorf("bestAccount = %v (score %v, polled %d), want %s (score %v, polled 2)",
+					got, score, polled, tc.want, tc.score)
+			}
+		})
+	}
+
+	// An exhausted Ultra account is usable again when its week resets.
+	if got := usableAt(pool.Usage{SevenDay: week(day, 100)}); !got.Equal(now.Add(day)) {
+		t.Errorf("ultra usableAt = %v, want %v", got, now.Add(day))
 	}
 }
 
@@ -57,9 +112,9 @@ func TestSoonestRecovery(t *testing.T) {
 	// Two exhausted accounts → the earlier reset wins; an account with no
 	// cached usage is skipped, not treated as usable now.
 	s := &pool.Store{Accounts: []*pool.Account{
-		{ID: "a", Usage: &pool.Usage{FiveHour: pool.Window{Pct: 100, ResetsAt: in3h}}},
+		{ID: "a", Usage: &pool.Usage{FiveHour: &pool.Window{Pct: 100, ResetsAt: in3h}}},
 		{ID: "b"},
-		{ID: "c", Usage: &pool.Usage{FiveHour: pool.Window{Pct: 100, ResetsAt: in1h}}},
+		{ID: "c", Usage: &pool.Usage{FiveHour: &pool.Window{Pct: 100, ResetsAt: in1h}}},
 	}}
 	if got := soonestRecovery(s); !got.Equal(in1h) {
 		t.Errorf("soonestRecovery = %v, want %v", got, in1h)
@@ -67,7 +122,7 @@ func TestSoonestRecovery(t *testing.T) {
 
 	// No account has a known usable-at time → zero (reset fields omitted).
 	s = &pool.Store{Accounts: []*pool.Account{
-		{ID: "a", Usage: &pool.Usage{FiveHour: pool.Window{Pct: 80, ResetsAt: in1h}}},
+		{ID: "a", Usage: &pool.Usage{FiveHour: &pool.Window{Pct: 80, ResetsAt: in1h}}},
 		{ID: "b"},
 	}}
 	if got := soonestRecovery(s); !got.IsZero() {
@@ -124,7 +179,7 @@ func TestIsOurHelper(t *testing.T) {
 func TestBestAccount(t *testing.T) {
 	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
 	use := func(pct float64, weekResetIn time.Duration) pool.Usage {
-		u := pool.Usage{FiveHour: pool.Window{Pct: pct, ResetsAt: now.Add(time.Hour)}}
+		u := pool.Usage{FiveHour: &pool.Window{Pct: pct, ResetsAt: now.Add(time.Hour)}}
 		if weekResetIn > 0 {
 			u.SevenDay = pool.Window{Pct: pct, ResetsAt: now.Add(weekResetIn)}
 		}
@@ -178,11 +233,11 @@ func TestSoonerCandidate(t *testing.T) {
 		{"resets later", &pool.Account{Usage: week(5*day, 0)}, false},
 		{"sooner but exhausted", &pool.Account{Usage: week(day, 100)}, false},
 		{"sooner, 5h spent until later", &pool.Account{Usage: &pool.Usage{
-			FiveHour: pool.Window{Pct: 100, ResetsAt: now.Add(time.Hour)},
+			FiveHour: &pool.Window{Pct: 100, ResetsAt: now.Add(time.Hour)},
 			SevenDay: pool.Window{Pct: 50, ResetsAt: now.Add(day)},
 		}}, false},
 		{"sooner, 5h spent but since reset", &pool.Account{Usage: &pool.Usage{
-			FiveHour: pool.Window{Pct: 100, ResetsAt: now.Add(-time.Minute)},
+			FiveHour: &pool.Window{Pct: 100, ResetsAt: now.Add(-time.Minute)},
 			SevenDay: pool.Window{Pct: 50, ResetsAt: now.Add(day)},
 		}}, true},
 		// Its week rolled over since the poll; the new one has not started.

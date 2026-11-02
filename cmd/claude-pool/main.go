@@ -102,8 +102,10 @@ Usage:
                                       out of rotation (its credential is still
                                       renewed); swaps away if it was in use
   claude-pool enable <id>             Put it back in rotation
-  claude-pool list [--json]           Show accounts (with 5h/7d usage) and keys;
-                                      --json dumps pool state (no network/secrets)
+  claude-pool list [--json]           Show accounts (with 5h/7d usage; 5h is "-"
+                                      on Ultra, which has no 5-hour window) and
+                                      keys; --json dumps pool state (no
+                                      network/secrets)
   claude-pool switch [flags] <id>     Switch to a specific account and pin it:
                                       auto keeps cc on it until it runs out,
                                       even while another resets sooner
@@ -139,7 +141,8 @@ Usage:
                                       plus the cached windows behind it:
                                       {usage_at,five_hour,seven_day,scoped[]},
                                       each {pct,resets_at,reset_in_seconds} and
-                                      scoped ones labelled by model (Fable)
+                                      scoped ones labelled by model (Fable);
+                                      five_hour is omitted on Ultra
   claude-pool version                 Print the build version
 
 Add accounts: log into cc with each account, then run `+"`import --id NAME`"+` each time.
@@ -1646,7 +1649,9 @@ func cmdStatus() error {
 	}
 	if a := s.Find(s.Current); a != nil && a.Usage != nil {
 		out.UsageAt = a.UsageAt.Format(time.RFC3339)
-		out.FiveHour = mkStatusWindow(a.Usage.FiveHour, now)
+		if a.Usage.FiveHour != nil {
+			out.FiveHour = mkStatusWindow(*a.Usage.FiveHour, now)
+		}
 		out.SevenDay = mkStatusWindow(a.Usage.SevenDay, now)
 		for _, w := range a.Usage.Scoped {
 			if sw := mkStatusWindow(w, now); sw != nil {

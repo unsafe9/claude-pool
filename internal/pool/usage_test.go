@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -53,6 +54,51 @@ func TestParseUsage_RejectsWindowlessResponse(t *testing.T) {
 	}
 }
 
+// Ultra has no 5-hour window: the API sends five_hour as null or leaves it out.
+// Either way it must stay absent all the way through, not read as an empty
+// window that renders "0%/0m".
+func TestParseUsage_NoFiveHourWindow(t *testing.T) {
+	const rest = `"seven_day": {"utilization": 54.0, "resets_at": "2026-08-18T12:59:59Z"},
+	  "limits": [{"kind": "weekly_scoped", "percent": 97, "resets_at": "2026-08-18T12:59:59Z",
+	    "scope": {"model": {"display_name": "Fable"}}}]}`
+	now := time.Date(2026, 8, 16, 12, 59, 59, 0, time.UTC)
+	for name, body := range map[string]string{
+		"null":    `{"five_hour": null, ` + rest,
+		"missing": `{` + rest,
+	} {
+		t.Run(name, func(t *testing.T) {
+			u, err := parseUsage(strings.NewReader(body))
+			if err != nil {
+				t.Fatalf("parseUsage: %v", err)
+			}
+			if u.FiveHour != nil {
+				t.Errorf("FiveHour = %+v, want nil", *u.FiveHour)
+			}
+			if n := len(u.Windows()); n != 2 {
+				t.Errorf("Windows() has %d entries, want 2 (7-day and Fable)", n)
+			}
+			if got := u.Score(); got != 97 {
+				t.Errorf("Score = %v, want 97", got)
+			}
+			if got, want := u.FormatStatusline(now), "- 54%/2d0h Fable:97%/2d0h"; got != want {
+				t.Errorf("FormatStatusline = %q, want %q", got, want)
+			}
+			// The usage cache in pool.json must keep the window absent too.
+			b, err := json.Marshal(u)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(b), "five_hour") {
+				t.Errorf("cached usage %s carries five_hour", b)
+			}
+			var back Usage
+			if err := json.Unmarshal(b, &back); err != nil || back.FiveHour != nil {
+				t.Errorf("cache round-trip FiveHour = %+v (err %v), want nil", back.FiveHour, err)
+			}
+		})
+	}
+}
+
 func TestParseUsage_AcceptsLimitsOnlyResponse(t *testing.T) {
 	body := `{"limits": [{"kind": "weekly_scoped", "percent": 100,
 	  "resets_at": "2026-08-18T12:59:59Z", "scope": {"model": {"display_name": "Fable"}}}]}`
@@ -68,7 +114,7 @@ func TestParseUsage_AcceptsLimitsOnlyResponse(t *testing.T) {
 func TestFormatStatusline_MatchesCompactForm(t *testing.T) {
 	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
 	u := Usage{
-		FiveHour: Window{Pct: 4.9, ResetsAt: now.Add(4*time.Hour + 40*time.Minute)},
+		FiveHour: &Window{Pct: 4.9, ResetsAt: now.Add(4*time.Hour + 40*time.Minute)},
 		SevenDay: Window{Pct: 2.1, ResetsAt: now.Add(6*24*time.Hour + 8*time.Hour)},
 	}
 	got := u.FormatStatusline(now)
@@ -81,7 +127,7 @@ func TestFormatStatusline_MatchesCompactForm(t *testing.T) {
 func TestFormatStatusline_TagsScopedWindows(t *testing.T) {
 	now := time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
 	u := Usage{
-		FiveHour: Window{Pct: 4.9, ResetsAt: now.Add(4*time.Hour + 40*time.Minute)},
+		FiveHour: &Window{Pct: 4.9, ResetsAt: now.Add(4*time.Hour + 40*time.Minute)},
 		SevenDay: Window{Pct: 2.1, ResetsAt: now.Add(6*24*time.Hour + 8*time.Hour)},
 		Scoped:   []Window{{Pct: 97, ResetsAt: now.Add(6*24*time.Hour + 8*time.Hour), Label: "Fable"}},
 	}
@@ -114,7 +160,7 @@ func TestShortDur(t *testing.T) {
 
 func TestScore_PicksBindingWindow(t *testing.T) {
 	u := Usage{
-		FiveHour: Window{Pct: 30},
+		FiveHour: &Window{Pct: 30},
 		SevenDay: Window{Pct: 70},
 	}
 	if got := u.Score(); got != 70 {
