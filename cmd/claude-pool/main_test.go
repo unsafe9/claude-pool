@@ -255,3 +255,40 @@ func TestSoonerCandidate(t *testing.T) {
 		})
 	}
 }
+
+// The usage API throttles polls hard, and an account whose poll failed drops
+// out of every pick. A throttled account must therefore still score from its
+// cache, or auto swaps off it, and a swap back to it finds nothing usable.
+// None of these cases may reach the network.
+func TestUsageForThrottled(t *testing.T) {
+	now := time.Now()
+	cached := &pool.Usage{
+		FiveHour: &pool.Window{Pct: 100, ResetsAt: now.Add(-time.Minute)}, // refilled since
+		SevenDay: pool.Window{Pct: 40, ResetsAt: now.Add(48 * time.Hour)},
+	}
+	for _, tc := range []struct {
+		name      string
+		a         pool.Account
+		wantScore float64
+		wantErr   bool
+	}{
+		{"throttled with cache serves it as of now",
+			pool.Account{ID: "a", Usage: cached, UsageAt: now.Add(-time.Hour), UsageRetryAt: now.Add(time.Minute)}, 40, false},
+		{"recent poll is reused",
+			pool.Account{ID: "a", Usage: cached, UsageAt: now.Add(-time.Second)}, 40, false},
+		{"throttled without cache is unknown",
+			pool.Account{ID: "a", UsageRetryAt: now.Add(time.Minute)}, 0, true},
+		{"dead grant never scores from cache",
+			pool.Account{ID: "a", Usage: cached, UsageAt: now, AuthError: "invalid_grant"}, 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			u, err := usageFor(&pool.Store{}, &tc.a)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if err == nil && u.Score() != tc.wantScore {
+				t.Errorf("score = %v, want %v", u.Score(), tc.wantScore)
+			}
+		})
+	}
+}

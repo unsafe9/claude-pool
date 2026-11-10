@@ -297,21 +297,69 @@ func markAuthError(a *pool.Account, err error) {
 	})
 }
 
-// usageFor is the one token→usage chain shared by list and auto, and the single
-// seam applying the pool's limit policy — so nothing downstream ever sees a
-// model-scoped window the pool opted out of.
+// usageFreshFor is how long a polled usage is served as-is. The usage API
+// answers 429 to a second poll of one account within seconds, and the
+// per-prompt hook alone would poll that often, so a poll that recent is reused
+// rather than repeated. A rate limit the cache misses meanwhile is the
+// StopFailure hook's to catch.
+const usageFreshFor = 2 * time.Minute
+
+// usageMinBackoff floors the wait after a 429, whose Retry-After is often 0.
+const usageMinBackoff = time.Minute
+
+// usageFor is the one token→usage chain shared by list, switch and auto, and
+// the single seam applying the pool's limit policy — so nothing downstream ever
+// sees a model-scoped window the pool opted out of.
+//
+// It also owns the usage cache: a fresh poll is recorded on a and in the store,
+// and a recent one is served instead of polling again. A 429 is the usage API
+// throttling the poll, not news about the quota, so it backs that account's
+// polls off and serves the last known usage; only an account with no cache at
+// all reports it as an error.
 func usageFor(s *pool.Store, a *pool.Account) (pool.Usage, error) {
+	if a.Revoked() {
+		return pool.Usage{}, reloginError(a.ID, a.AuthError)
+	}
+	now := time.Now()
+	throttled := now.Before(a.UsageRetryAt)
+	if a.Usage != nil && (throttled || now.Sub(a.UsageAt) < usageFreshFor) {
+		return a.Usage.At(now), nil
+	}
+	if throttled {
+		return pool.Usage{}, &pool.RateLimitError{RetryAfter: a.UsageRetryAt.Sub(now)}
+	}
 	od, err := ensureFresh(a)
 	if err != nil {
 		return pool.Usage{}, err
 	}
 	u, err := pool.FetchUsage(od.AccessToken)
+	var rl *pool.RateLimitError
+	if errors.As(err, &rl) {
+		a.UsageRetryAt = now.Add(max(rl.RetryAfter, usageMinBackoff))
+		_, _ = pool.LockedUpdate(func(st *pool.Store) error {
+			if e := st.Find(a.ID); e != nil {
+				e.UsageRetryAt = a.UsageRetryAt
+			}
+			return nil
+		})
+		if a.Usage != nil {
+			return a.Usage.At(now), nil
+		}
+		return pool.Usage{}, err
+	}
 	if err != nil {
 		return pool.Usage{}, err
 	}
 	if s.IgnoreScopedLimits {
 		u = u.WithoutScoped()
 	}
+	a.Usage, a.UsageAt, a.UsageRetryAt = &u, now, time.Time{}
+	_, _ = pool.LockedUpdate(func(st *pool.Store) error {
+		if e := st.Find(a.ID); e != nil {
+			e.Usage, e.UsageAt, e.UsageRetryAt = &u, now, time.Time{}
+		}
+		return nil
+	})
 	return u, nil
 }
 
@@ -742,7 +790,6 @@ func cmdList(args []string) error {
 	}
 	now := time.Now()
 	usages, errs := pollAccounts(s, nil)
-	cacheUsages(s, usages, errs)
 	var needLogin []string
 	for i, a := range s.Accounts {
 		marker := "  "
@@ -767,7 +814,8 @@ func cmdList(args []string) error {
 		case errs[i] != nil:
 			fmt.Printf("%s%-16s  (error: %v)%s\n", marker, a.ID, errs[i], pinNote(s, a, now))
 		default:
-			fmt.Printf("%s%-16s  %s%s%s\n", marker, a.ID, usages[i].FormatStatusline(now), pinNote(s, a, now), grantNote(a, now))
+			fmt.Printf("%s%-16s  %s%s%s%s\n", marker, a.ID, usages[i].FormatStatusline(now),
+				cacheNote(a, now), pinNote(s, a, now), grantNote(a, now))
 		}
 	}
 	for _, k := range s.APIKeys {
@@ -788,6 +836,15 @@ func cmdList(args []string) error {
 		}
 	}
 	return nil
+}
+
+// cacheNote marks a usage line served from a poll made earlier, which the usage
+// API's rate limit makes routine, so a stale figure does not pass for a live one.
+func cacheNote(a *pool.Account, now time.Time) string {
+	if age := now.Sub(a.UsageAt); age >= time.Minute {
+		return "  (as of " + pool.ShortDur(age) + " ago)"
+	}
+	return ""
 }
 
 // pinNote marks the account a manual pin is holding cc on, as a suffix for the
@@ -863,7 +920,6 @@ func cmdSwitch(args []string) error {
 		// Best-effort: a failed poll still switches, on the fallback pin length.
 		u, uerr := usageFor(s, a)
 		if uerr == nil {
-			cacheUsage(a.ID, u)
 			if at := usableAt(u); !at.IsZero() {
 				fmt.Fprintf(os.Stderr, "note: %q is exhausted for another %s; auto will move off it at the next hook\n",
 					id, pool.ShortDur(at.Sub(now)))
@@ -1018,7 +1074,6 @@ func cmdAuto(args []string) error {
 		u, err := usageFor(s, p)
 		switch {
 		case err == nil:
-			cacheUsage(p.ID, u)
 			if u.Score() < 100 {
 				return finish(nil)
 			}
@@ -1040,7 +1095,6 @@ func cmdAuto(args []string) error {
 		// point is to move off it, however much headroom it has left.
 		if cur := s.Find(s.Current); cur != nil && !cur.Disabled {
 			if u, err := usageFor(s, cur); err == nil {
-				cacheUsage(cur.ID, u)
 				if u.Score() < *threshold*100 && !soonerCandidate(s, cur, u, now, *threshold*100) {
 					return finish(nil)
 				}
@@ -1067,7 +1121,6 @@ func cmdAuto(args []string) error {
 	}
 
 	usages, errs := pollAccounts(s, curUsage)
-	cacheUsages(s, usages, errs)
 	best, bestScore, polled := bestAccount(s, usages, errs, *threshold*100)
 
 	switch {
@@ -1228,16 +1281,7 @@ func soonerCandidate(s *pool.Store, cur *pool.Account, u pool.Usage, now time.Ti
 
 // cachedScore is Usage.Score as of now: a window whose reset has passed since
 // the poll counts as empty.
-func cachedScore(u pool.Usage, now time.Time) float64 {
-	score := 0.0
-	for _, w := range u.Windows() {
-		if !w.ResetsAt.IsZero() && !now.Before(w.ResetsAt) {
-			continue
-		}
-		score = math.Max(score, w.Pct)
-	}
-	return score
-}
+func cachedScore(u pool.Usage, now time.Time) float64 { return u.At(now).Score() }
 
 // resetsSooner orders reset times with an unknown one (a window that has not
 // started, so nothing in it is at risk) last.
@@ -1345,43 +1389,6 @@ func stillExhausted(a *pool.Account, now time.Time) bool {
 	}
 	t := usableAt(*a.Usage)
 	return !t.IsZero() && now.Before(t)
-}
-
-// cacheUsages persists each successfully-polled usage, keyed by ID. usages/errs
-// stay indexed parallel to s.Accounts, which is why this uses LockedUpdate and
-// never s.Update: a fresh disk load could change the slice's length and leave
-// the caller's print/scoring loop indexing out of range. Only future processes
-// read the cache. Call on the main goroutine, after pollAccounts joins.
-func cacheUsages(s *pool.Store, usages []pool.Usage, errs []error) {
-	now := time.Now()
-	_, _ = pool.LockedUpdate(func(st *pool.Store) error {
-		for i, a := range s.Accounts {
-			if errs[i] != nil {
-				continue
-			}
-			if e := st.Find(a.ID); e != nil {
-				u := usages[i]
-				e.Usage = &u
-				e.UsageAt = now
-			}
-		}
-		return nil
-	})
-}
-
-// cacheUsage persists one account's freshly-polled usage. The fast path polls
-// only the current account and returns before pollAccounts runs, so without
-// this the cache — which `status` serves to statuslines — would only refresh on
-// the comparatively rare full polls.
-func cacheUsage(id string, u pool.Usage) {
-	now := time.Now()
-	_, _ = pool.LockedUpdate(func(st *pool.Store) error {
-		if e := st.Find(id); e != nil {
-			e.Usage = &u
-			e.UsageAt = now
-		}
-		return nil
-	})
 }
 
 // usableAt is the moment u's exhausted windows have all reset — zero when the

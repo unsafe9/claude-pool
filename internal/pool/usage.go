@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -50,6 +51,30 @@ func (u Usage) WithoutScoped() Usage {
 	return u
 }
 
+// At is u as of now, for a usage polled earlier: a window whose reset has
+// passed since has refilled, so it reads as empty with its reset unknown.
+func (u Usage) At(now time.Time) Usage {
+	lapse := func(w Window) Window {
+		if !w.ResetsAt.IsZero() && !now.Before(w.ResetsAt) {
+			w.Pct, w.ResetsAt = 0, time.Time{}
+		}
+		return w
+	}
+	if u.FiveHour != nil {
+		w := lapse(*u.FiveHour)
+		u.FiveHour = &w
+	}
+	u.SevenDay = lapse(u.SevenDay)
+	scoped := make([]Window, len(u.Scoped))
+	for i, w := range u.Scoped {
+		scoped[i] = lapse(w)
+	}
+	if len(scoped) > 0 {
+		u.Scoped = scoped
+	}
+	return u
+}
+
 // Score is the binding utilization (0..100): the most-constrained window, since
 // any one of them reaching 100 takes the account offline. A model-scoped window
 // counts the same as an account-wide one — an account whose Fable quota is spent
@@ -61,6 +86,16 @@ func (u Usage) Score() float64 {
 	}
 	return score
 }
+
+// RateLimitError is the usage API's 429. The endpoint allows each account only
+// a few polls per several minutes — two in a row can already trip it — so it
+// says nothing about the account's quota, only that the poll came too soon.
+// RetryAfter is the server's Retry-After, zero when it gave none (or "0").
+type RateLimitError struct {
+	RetryAfter time.Duration
+}
+
+func (e *RateLimitError) Error() string { return "usage API: HTTP 429" }
 
 // FetchUsage queries the subscription usage API with an OAuth access token.
 func FetchUsage(accessToken string) (Usage, error) {
@@ -76,6 +111,10 @@ func FetchUsage(accessToken string) (Usage, error) {
 		return Usage{}, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		secs, _ := strconv.Atoi(resp.Header.Get("Retry-After"))
+		return Usage{}, &RateLimitError{RetryAfter: time.Duration(secs) * time.Second}
+	}
 	if resp.StatusCode != http.StatusOK {
 		return Usage{}, fmt.Errorf("usage API: HTTP %d", resp.StatusCode)
 	}

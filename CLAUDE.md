@@ -57,6 +57,13 @@ revive when a later swap lands back on that account. `auto` polls for seconds
 before it swaps, so its swaps are guarded on the selection it started from
 (`guardSelection`) and yield to a `switch` that landed meanwhile.
 
+The usage API (`/api/oauth/usage`) throttles each account hard: a second poll
+seconds after the first can get 429. A 429 means the poll came too soon, not
+that the quota is spent, so a throttled account keeps its place in selection on
+its cached usage. Poll through `usageFor`, which owns that cache and the
+per-account backoff; a direct `FetchUsage` caller drops a throttled account out
+of every pick, and `auto` swaps off it.
+
 Tests must never reach the token endpoint — a refresh there consumes a real
 token. Point `oauthTokenURL` at an `httptest` server instead.
 

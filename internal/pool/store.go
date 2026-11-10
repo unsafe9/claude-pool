@@ -32,6 +32,10 @@ type Account struct {
 
 	Usage   *Usage    `json:"usage,omitempty"`    // last polled usage (cache)
 	UsageAt time.Time `json:"usage_at,omitempty"` // when Usage was fetched
+
+	// UsageRetryAt is when the usage API, having answered 429, accepts this
+	// account's polls again. Until then every reader serves the cache.
+	UsageRetryAt time.Time `json:"usage_retry_at,omitempty"`
 }
 
 // Revoked reports whether the server has permanently rejected this account's
